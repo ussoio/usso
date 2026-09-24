@@ -1,0 +1,46 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "FastAPI (uvicorn)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": ["server.server:app", "--reload"],
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}/app",
+      "jinja": true,
+      "justMyCode": false
+    },
+    {
+      "name": "pytest: current file",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["${file}", "-vv"],
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}/app",
+      "justMyCode": false
+    },
+    {
+      "name": "pytest: all",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["tests"],
+      "envFile": "${workspaceFolder}/.env",
+      "cwd": "${workspaceFolder}/app",
+      "justMyCode": false
+    },
+    {
+      "name": "pytest (attach)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "127.0.0.1",
+        "port": 3020
+      },
+      "justMyCode": false
+    }
+  ]
+}

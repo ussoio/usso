@@ -1,0 +1,64 @@
+services:
+  app:
+    image: ${USSO_APP_IMAGE:?Set USSO_APP_IMAGE}:${IMAGE_TAG:-0.3.1}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+      - /app/logs:size=32m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    hostname: ${PROJECT_NAME}
+    env_file:
+      - .env
+    networks:
+      - traefik-net
+      - mongo-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${PROJECT_NAME}.entrypoints=web"
+      - "traefik.http.routers.${PROJECT_NAME}.rule=(${DOMAINS}) && (PathPrefix(`/api`) || PathPrefix(`/.well-known`))"
+      - "traefik.http.routers.${PROJECT_NAME}.priority=100"
+      - "traefik.http.routers.${PROJECT_NAME}.middlewares=${PROJECT_NAME}-https"
+      - "traefik.http.middlewares.${PROJECT_NAME}-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.${PROJECT_NAME}-https.redirectscheme.permanent=true"
+      - "traefik.http.routers.${PROJECT_NAME}-secure.entrypoints=websecure"
+      - "traefik.http.routers.${PROJECT_NAME}-secure.rule=(${DOMAINS}) && (PathPrefix(`/api`) || PathPrefix(`/.well-known`))"
+      - "traefik.http.routers.${PROJECT_NAME}-secure.priority=100"
+      - "traefik.http.routers.${PROJECT_NAME}-secure.tls=true"
+      - "traefik.http.routers.${PROJECT_NAME}-secure.tls.certresolver=letsencrypt"
+      - "traefik.http.services.${PROJECT_NAME}.loadbalancer.server.port=8000"
+      - "traefik.docker.network=traefik-net"
+
+  dashboard:
+    image: ${USSO_DASHBOARD_IMAGE:?Set USSO_DASHBOARD_IMAGE}:${IMAGE_TAG:-0.3.1}
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - NEXT_PUBLIC_USSO_API_URL=${NEXT_PUBLIC_USSO_API_URL:-}
+    networks:
+      - traefik-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard.entrypoints=web"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard.rule=${DOMAINS}"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard.priority=1"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard.middlewares=${PROJECT_NAME}-https"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard-secure.entrypoints=websecure"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard-secure.rule=${DOMAINS}"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard-secure.priority=1"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard-secure.tls=true"
+      - "traefik.http.routers.${PROJECT_NAME}-dashboard-secure.tls.certresolver=letsencrypt"
+      - "traefik.http.services.${PROJECT_NAME}-dashboard.loadbalancer.server.port=3036"
+      - "traefik.docker.network=traefik-net"
+
+networks:
+  traefik-net:
+    external: true
+  mongo-net:
+    external: true

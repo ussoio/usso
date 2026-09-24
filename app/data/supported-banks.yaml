@@ -1,0 +1,145 @@
+- model: currency_operations.bank
+  pk: 10
+  fields:
+    name: بانک مرکزی
+    national_id: '14002207985'
+- model: currency_operations.bank
+  pk: 11
+  fields:
+    name: صنعت و معدن
+    national_id: '10100841160'
+- model: currency_operations.bank
+  pk: 12
+  fields:
+    name: ملت
+    national_id: '10100834967'
+- model: currency_operations.bank
+  pk: 13
+  fields:
+    name: رفاه ‌کارگران
+    national_id: '10100334245'
+- model: currency_operations.bank
+  pk: 14
+  fields:
+    name: مسکن
+    national_id: '10100830792'
+- model: currency_operations.bank
+  pk: 15
+  fields:
+    name: سپه
+    national_id: '10862064732'
+- model: currency_operations.bank
+  pk: 16
+  fields:
+    name: کشاورزی
+    national_id: '10100830184'
+- model: currency_operations.bank
+  pk: 17
+  fields:
+    name: ملی
+    national_id: '10861677542'
+- model: currency_operations.bank
+  pk: 18
+  fields:
+    name: تجارت
+    national_id: '10100834460'
+- model: currency_operations.bank
+  pk: 19
+  fields:
+    name: صادرات
+    national_id: '10861736062'
+- model: currency_operations.bank
+  pk: 20
+  fields:
+    name: توسعه ‌صادرات
+    national_id: '10101313616'
+- model: currency_operations.bank
+  pk: 21
+  fields:
+    name: پست ‌بانک
+    national_id: '10101702747'
+- model: currency_operations.bank
+  pk: 22
+  fields:
+    name: توسعه تعاون
+    national_id: '10104021538'
+- model: currency_operations.bank
+  pk: 53
+  fields:
+    name: کارآفرين
+    national_id: '10102006226'
+- model: currency_operations.bank
+  pk: 54
+  fields:
+    name: پارسيان
+    national_id: '10102203401'
+- model: currency_operations.bank
+  pk: 55
+  fields:
+    name: اقتصادنوين
+    national_id: '10102194601'
+- model: currency_operations.bank
+  pk: 56
+  fields:
+    name: سامان
+    national_id: '10101972093'
+- model: currency_operations.bank
+  pk: 57
+  fields:
+    name: پاسارگاد
+    national_id: '10102946956'
+- model: currency_operations.bank
+  pk: 58
+  fields:
+    name: سرمايه‌
+    national_id: '10103798457'
+- model: currency_operations.bank
+  pk: 59
+  fields:
+    name: سينا
+    national_id: '10860246171'
+- model: currency_operations.bank
+  pk: 61
+  fields:
+    name: بانک شهر
+    national_id: '10103886081'
+- model: currency_operations.bank
+  pk: 62
+  fields:
+    name: آینده
+    national_id: '10320894878'
+- model: currency_operations.bank
+  pk: 63
+  fields:
+    name: انصار
+    national_id: '10320255230'
+- model: currency_operations.bank
+  pk: 64
+  fields:
+    name: گردشگری
+    national_id: '10320435268'
+- model: currency_operations.bank
+  pk: 65
+  fields:
+    name: حکمت ايرانيان
+    national_id: '10100451588'
+- model: currency_operations.bank
+  pk: 66
+  fields:
+    name: دی
+    national_id: '10320237706'
+- model: currency_operations.bank
+  pk: 78
+  fields:
+    name: خاورمیانه
+    national_id: '10320826196'
+- model: currency_operations.bank
+  pk: 95
+  fields:
+    name: ايران ونزوئلا
+    national_id: '10320162713'
+- model: currency_operations.bank
+  pk: 30
+  fields:
+    name: پی ال سی لندن
+    national_id: '10100174158'

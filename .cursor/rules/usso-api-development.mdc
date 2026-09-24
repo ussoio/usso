@@ -1,0 +1,68 @@
+---
+description: USSO server conventions for adding or changing FastAPI APIs
+globs: app/apps/**/*.py
+alwaysApply: false
+---
+
+# USSO API development
+
+FastAPI server under `app/`. Base path: `/api/sso/v1`. Register routers in `app/server/server.py`.
+
+## Module layout
+
+Each feature package under `apps/<domain>/<feature>/`:
+
+- `schemas.py` — Pydantic create/response/update types
+- `models.py` — Beanie document
+- `routes.py` — HTTP handlers
+- `services.py` — business logic and external HTTP calls
+
+Run tests from `app/` with `pytest`. Use fixtures: `client`, `captcha_client`, `authenticated_client`.
+
+## Pattern A: CRUD entity (default)
+
+Subclass `AbstractTenantUSSORouter` from `utils/usso_routes.py`.
+
+```python
+class WidgetRouter(AbstractTenantUSSORouter):
+    model = models.Widget
+    schema = schemas.WidgetSchema
+    resource = "widget"  # for authorize()
+
+router = WidgetRouter().router
+```
+
+- Tenant-scoped model: `TenantScopedEntity` + `TenantScopedEntitySchema`
+- User-scoped model: `TenantUserEntity` + `TenantUserEntitySchema`
+- Override `create_item`, `list_items`, etc. when needed
+- Custom paths: override `config_routes()` and call `super().config_routes(...)`
+- Auth: `user = await self.get_user(request)` then `await self.authorize(...)`
+
+Reference: `apps/access_control/role/`, `apps/identity/referral/`.
+
+## Pattern B: custom routes
+
+Use `APIRouter` for non-CRUD flows (auth, callbacks, redirects).
+
+```python
+tenant = await get_request_tenant(request)
+raise exceptions.BaseHTTPException(status_code=400, error="code", detail="msg")
+```
+
+Reference: `apps/identity/kyc/routes.py`, `apps/identity/auth/routes.py`.
+
+## Checklist for new API
+
+1. Pick domain: `identity/`, `access_control/`, or `tenant/`
+2. Add schemas → model → services → routes
+3. Register router in `server/server.py`
+4. Add test under `tests/` using `authenticated_client` when auth required
+5. Always scope by `tenant_id` (and `user_id` for user-owned resources)
+
+## Do not
+
+- Put heavy logic in route handlers — use `services.py`
+- Skip router registration in `server.py`
+- Use sync I/O in async handlers
+
+Deep reference: `@.cursor/architectures.md`

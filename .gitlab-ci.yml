@@ -1,0 +1,64 @@
+variables:
+  DOCKER_IMAGE: ${CI_REGISTRY}/usso/usso-backend
+
+stages:
+  - tag
+  - build
+  - deploy
+  - notify
+
+.only_tags:
+  rules:
+    - if: '$CI_COMMIT_TAG && $CI_COMMIT_TAG !~ /^v[0-9]+\.[0-9]+\.0$/'
+
+.tag:
+  stage: tag
+  script:
+    - echo "Tagging with $CI_COMMIT_TAG"
+    - echo "$CI_COMMIT_TAG" > tag.txt
+  artifacts:
+    paths:
+      - tag.txt
+  retry: 2
+
+.build:
+  stage: build
+  image: docker:27.5.1
+  services:
+    - docker:27.5.1-dind
+  variables:
+    DOCKER_TLS_CERTDIR: /certs
+  before_script:
+    - docker login ${CI_REGISTRY} -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD}
+    - docker login ${NEW_CI_REGISTRY} -u ${NEW_CI_REGISTRY_USER} -p ${NEW_CI_REGISTRY_PASSWORD}
+  script:
+    - docker build app -f app/Dockerfile -t ${DOCKER_IMAGE}:${CI_COMMIT_TAG}
+    - docker push ${DOCKER_IMAGE}:${CI_COMMIT_TAG}
+    - docker tag ${DOCKER_IMAGE}:${CI_COMMIT_TAG} ${NEW_CI_REGISTRY}/${CI_PROJECT_PATH}-prod:${CI_COMMIT_TAG}
+    - docker push ${NEW_CI_REGISTRY}/${CI_PROJECT_PATH}-prod:${CI_COMMIT_TAG}
+  retry: 2
+
+tag:
+  extends:
+    - .only_tags
+    - .tag
+
+build:
+  extends:
+    - .only_tags
+    - .build
+  needs:
+    - tag
+
+notify_failure:
+  stage: notify
+  image: alpine/curl:latest
+  script:
+    - >
+      curl -s --data "chat_id=$TELEGRAM_CHAT_ID"
+      --data "message_thread_id=$TELEGRAM_TOPIC_ID"
+      --data "text=Pipeline Failed: $CI_PROJECT_NAME, ref $CI_COMMIT_REF_NAME. $CI_PROJECT_URL/pipelines/$CI_PIPELINE_ID"
+      "$TELEGRAM_API_URL/bot$TELEGRAM_BOT_TOKEN/sendMessage"
+  when: on_failure
+  allow_failure: true
+  retry: 2

@@ -1,0 +1,15 @@
+---
+description: USSO project stack and entry points
+alwaysApply: true
+---
+
+# USSO project context
+
+Multi-tenant SSO platform. Python 3.13+. Code lives in `app/`.
+
+- Entry: `app/main.py` → `app/server/server.py`
+- Config: `app/server/config.py` (env from `.env`, copy from `sample.env`)
+- Stack: FastAPI, Beanie/MongoDB (`fastapi-mongo-base`), Redis, `usso` JWT auth
+- Domains: `apps/identity/`, `apps/access_control/`, `apps/tenant/`, `apps/captcha/`
+
+When adding APIs, follow `.cursor/rules/usso-api-development.mdc` and read `.cursor/architectures.md` for full patterns.

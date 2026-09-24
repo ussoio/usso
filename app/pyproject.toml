@@ -1,0 +1,119 @@
+[project]
+name = "usso-server"
+version = "0.3.19"
+description = "USSO: A Secure, Multi-Tenant SSO Platform for modern SaaS and microservice architectures."
+# readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiocache>=0.12.3",
+    "argon2-cffi>=25.1.0",
+    "captcha>=0.7.1",
+    "fastapi>=0.139.0",
+    "fastapi-limiter>=0.2.0",
+    "fastapi-mongo-base[sentry]>=1.8.9",
+    "httpx>=0.28.1",
+    "ip2location>=8.11.0",
+    "jinja2>=3.1.6",
+    "persiantools>=6.1.0",
+    "phonenumbers>=9.0.24",
+    "pydantic[email]>=2.12.5",
+    "pyotp>=2.9.0",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.32",
+    "qrcode[pil]>=8.2",
+    "redis>=8.1.0",
+    "sentry-sdk[fastapi]>=2.66.1",
+    "usso>=0.31.13",
+    "uvicorn>=0.52.1",
+    "webauthn>=3.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "debugpy>=1.8.21",
+    "httpx2>=2.9.1",
+    "ipython>=9.16.1",
+    "mongomock-motor>=0.0.36",
+    "mypy>=2.2.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
+    "ruff>=0.16.1",
+    "testcontainers[mongodb,redis]>=4.15.0",
+    "ty>=0.0.65",
+]
+vault = ["hvac>=1.2.0"]
+
+[tool.ruff]
+line-length = 88         # Black's default line length
+target-version = "py313"
+fix = true
+# unsafe-fixes = true
+preview = true
+
+[tool.ruff.lint]
+select = [
+    "F",     # Pyflakes: critical errors and unused code
+    "E",     # Pyflakes: errors
+    "W",     # PEP8: formatting issues
+    "I",     # isort: import sorting
+    "UP",    # pyupgrade: modern syntax
+    "B",     # bugbear: potential bugs
+    "T",     # debugger / print statement checks
+    "C",     # complexity: complexity checking
+    "A",     # avoids shadowing Python built-ins
+    "ASYNC", # async/await syntax
+    "SIM",   # simplify: cleaner code
+    "PERF",  # performance optimizations
+    "TRY",   # better try/excepts
+    "N",     # naming conventions
+    "S",     # security checks
+    "ANN",   # type annotation checks
+    "T20",   # no print()
+    "C4",    # comprehension: better loops
+    "COM",   # enforces trailing commas where needed.
+    "EXE",   # executable: executable checking
+    "ISC",   # implicit string concatenation
+    "G",     # misuse of logging string interpolation
+    "D",     # docstrings: docstring checking
+    "ERA",   # remove commented code
+    "RUF",   # ruff-specific improvements
+]
+ignore = [
+    "raise-vanilla-args",
+    "missing-trailing-comma",
+    "function-call-in-default-argument",
+    "blank-line-after-function",
+    "incorrect-blank-line-before-class",
+    "new-line-after-last-paragraph",
+    "multi-line-summary-first-line",
+    "missing-blank-line-after-last-section",
+    "hardcoded-password-string",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    "logging-f-string",
+    "pytest-fixture-autouse",
+    "assert",
+    "hardcoded-password-func-arg",
+    "undocumented-public-function",
+    "undocumented-public-class",
+    "undocumented-public-method",
+]
+"server/db.py" = ["TRY"]
+"apps/tenant/messaging/channels/sms.py" = ["commented-out-code"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+check_untyped_defs = false
+disallow_untyped_defs = false
+disable_error_code = ["override"]
+
+[tool.ty.rules]
+# Minimal enablement so `ty check .` is meaningful.
