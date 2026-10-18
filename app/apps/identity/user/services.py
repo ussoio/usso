@@ -353,7 +353,7 @@ async def find_user(
     identifier_record: dict = result[0].get("identifier", {})
     user_identifier = UserIdentifier(**identifier_record)
     user = User(**(identifier_record.get("user") or {}))
-    user.tenant = tenant or Tenant(**identifier_record.get("tenant"))
+    user.tenant = tenant or Tenant(**(identifier_record.get("tenant") or {}))
     user.current_identifier = user_identifier
     user.credentials = [
         Credential(**credential)
