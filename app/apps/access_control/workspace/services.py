@@ -1,5 +1,6 @@
 """Workspace services."""
 
+import logging
 import re
 import secrets
 from datetime import date, datetime, timedelta
@@ -30,6 +31,8 @@ from server.exceptions import (
 )
 
 from .scopes import get_default_workspace_scopes
+
+logger = logging.getLogger(__name__)
 
 PERSONAL_WORKSPACE_DEFAULT_NAME = "شخصی"
 PERSONAL_WORKSPACE_OWNER_ROLE = "owner"
@@ -478,6 +481,34 @@ async def _init_workspace_roles(*, workspace: Workspace) -> Role:
     )
 
 
+WORKSPACE_MANAGER_SCOPE = "manage:sso/usso/member?workspace_id={workspace_id}"
+
+
+async def backfill_workspace_manager_scope() -> int:
+    """
+    Give existing workspace CEO roles the workspace-scoped member manage scope.
+
+    Roles created before the scope existed are never rewritten by
+    ``_ensure_workspace_role``. Idempotent startup step; returns roles updated.
+    """
+    updated = 0
+    roles = await Role.find({
+        "name": "CEO",
+        "workspace_id": {"$ne": None},
+        "is_deleted": False,
+    }).to_list()
+    for role in roles:
+        scope = WORKSPACE_MANAGER_SCOPE.format(workspace_id=role.workspace_id)
+        if scope in (role.scopes or []):
+            continue
+        role.scopes = [*(role.scopes or []), scope]
+        await role.save()
+        updated += 1
+    if updated:
+        logger.info("backfill_workspace_manager_scope updated=%s", updated)
+    return updated
+
+
 async def _init_personal_workspace_roles(*, workspace: Workspace) -> Role:
     """Create the default owner role for a personal workspace."""
     existing = await Role.find_one({
@@ -729,11 +760,7 @@ async def add_workspace_member(
 ) -> WorkspaceMemberSchema:
     """Add a user to a workspace without invitation (manage:sso/usso/member)."""
     require_workspace_enabled(tenant)
-    if not authorization.check_access(
-        user_scopes=user_data.scopes or [],
-        resource_path="sso/usso/member",
-        action="manage",
-    ):
+    if not can_manage_workspace_members(user_data=user_data, workspace_id=workspace_id):
         raise ForbiddenError(
             error_code="user_manage_denied",
             detail="You do not have manage access on workspace members",
@@ -792,11 +819,7 @@ async def remove_workspace_member(
 ) -> None:
     """Remove a user from a workspace (manage:sso/usso/member)."""
     require_workspace_enabled(tenant)
-    if not authorization.check_access(
-        user_scopes=user_data.scopes or [],
-        resource_path="sso/usso/member",
-        action="manage",
-    ):
+    if not can_manage_workspace_members(user_data=user_data, workspace_id=workspace_id):
         raise ForbiddenError(
             error_code="user_manage_denied",
             detail="You do not have manage access on workspace members",
@@ -821,6 +844,23 @@ async def remove_workspace_member(
             k: v for k, v in user.workspace_roles.items() if k != workspace_id
         }
     await user.save()
+
+
+def can_manage_workspace_members(*, user_data: UserData, workspace_id: str) -> bool:
+    """
+    Return whether the caller may add/remove members of ``workspace_id``.
+
+    Tenant ``manage:sso/usso/member`` covers every workspace; a workspace
+    manager holds ``manage:sso/usso/member?workspace_id=<ws>`` (e.g. via the
+    workspace CEO role) and covers only that workspace. Granted roles still
+    pass ``assert_assignable_workspace_role`` (no privilege escalation).
+    """
+    return authorization.check_access(
+        user_scopes=user_data.scopes or [],
+        resource_path="sso/usso/member",
+        action="manage",
+        filters={"workspace_id": workspace_id},
+    )
 
 
 def require_workspace_enabled(tenant: Tenant) -> None:

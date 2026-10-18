@@ -19,28 +19,24 @@ async def test_get_user_access_or_temporary_accepts_either_token(
     router = routes.LegalDocumentRouter()
     access_user = SimpleNamespace(uid="access") if access_wins else None
     temporary_user = SimpleNamespace(uid="temporary")
-    access_auth = SimpleNamespace(
-        usso_access_security_async=AsyncMock(return_value=access_user)
+
+    optional_user_async = AsyncMock(
+        side_effect=lambda _request, token_type=None: (
+            access_user if token_type == "access" else temporary_user
+        )
     )
-    temporary_auth = SimpleNamespace(
-        usso_access_security_async=AsyncMock(return_value=temporary_user)
-    )
-    tenant = SimpleNamespace(
-        get_auth=MagicMock(return_value=access_auth), temporary_auth=temporary_auth
-    )
+    tenant = SimpleNamespace(optional_user_async=optional_user_async)
     with patch.object(router, "get_tenant", new=AsyncMock(return_value=tenant)):
         result = await router.get_user_access_or_temporary(MagicMock())
 
     assert result.uid == ("access" if access_wins else "temporary")
-    access_auth.usso_access_security_async.assert_awaited_once()
-    temporary_auth.usso_access_security_async.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_get_user_access_or_temporary_handles_unauthenticated_request() -> None:
     router = routes.LegalDocumentRouter()
-    auth = SimpleNamespace(usso_access_security_async=AsyncMock(return_value=None))
-    tenant = SimpleNamespace(get_auth=MagicMock(return_value=auth), temporary_auth=auth)
+
+    tenant = SimpleNamespace(optional_user_async=AsyncMock(return_value=None))
     with patch.object(router, "get_tenant", new=AsyncMock(return_value=tenant)):
         assert (
             await router.get_user_access_or_temporary(

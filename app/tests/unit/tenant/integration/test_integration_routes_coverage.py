@@ -1,6 +1,7 @@
 """Focused direct-call coverage for OAuth/OIDC route handlers."""
 
 import base64
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -98,6 +99,16 @@ def _token_kwargs(grant_type: object, **overrides: object) -> dict[str, object]:
     return values
 
 
+@pytest.fixture(autouse=True)
+def _no_stored_consent() -> Iterator[None]:
+    """Default: no persisted consent; grants are not written to the database."""
+    with (
+        patch.object(routes.UserConsent, "covers", new=AsyncMock(return_value=False)),
+        patch.object(routes.UserConsent, "grant", new=AsyncMock()),
+    ):
+        yield
+
+
 @pytest.mark.asyncio
 async def test_token_rejects_malformed_and_conflicting_basic_auth() -> None:
     tenant = _tenant()
@@ -189,6 +200,7 @@ async def test_authorize_redirects_unauthenticated_user_to_login() -> None:
             None,
             None,
             None,
+            provider=None,
         )
     assert response.headers["location"].startswith(
         "https://frontend.test/login?redirect_to="
@@ -286,6 +298,49 @@ async def test_authorize_creates_session_and_redirects_to_consent() -> None:
     )
     create_session.assert_called_once()
     session.save.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_authorize_skips_consent_when_require_consent_false() -> None:
+    tenant = _tenant()
+    user = SimpleNamespace(uid="user-1")
+    client = _client()
+    client.require_consent = False
+    with (
+        patch.object(routes, "get_tenant", new=AsyncMock(return_value=tenant)),
+        patch.object(
+            routes,
+            "validate_authorization_request",
+            new=AsyncMock(return_value=(client, ["openid", "profile"])),
+        ),
+        patch.object(
+            routes.dependencies,
+            "get_current_user_optional",
+            new=AsyncMock(return_value=user),
+        ),
+        patch.object(
+            routes,
+            "_handle_authorized_user",
+            new=AsyncMock(
+                return_value=RedirectResponse("ir.getmirza.flow:/oauth?code=xyz")
+            ),
+        ) as handle,
+    ):
+        response = await routes.authorize(
+            _request(),
+            ResponseType.CODE,
+            "mirza-flow",
+            "ir.getmirza.flow:/oauth",
+            "openid profile",
+            "state_1234567890123456",
+            None,
+            "S256",
+            None,
+            None,
+            None,
+        )
+    assert response.headers["location"] == "ir.getmirza.flow:/oauth?code=xyz"
+    handle.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -434,6 +489,9 @@ async def test_consent_authorize_grants_scopes_and_returns_code() -> None:
         ) as create_code,
     ):
         response = await routes.consent_authorize(_request(), "state-1", True)
+        routes.UserConsent.grant.assert_awaited_once_with(
+            tenant.uid, "user-1", "client-1", ["openid", "profile"]
+        )
     assert response.headers["location"] == (
         "https://client.test/callback?code=granted-code&state=state-1"
     )
@@ -1042,3 +1100,128 @@ async def test_rotate_client_secret_errors(
         pytest.raises(error_type),
     ):
         await routes.rotate_client_secret(_request(), "client-1")
+
+
+async def _authorize_with_stored_consent(
+    *, covered: bool, scopes: list[str]
+) -> tuple[object, AsyncMock, AsyncMock, MagicMock]:
+    tenant = _tenant()
+    user = SimpleNamespace(uid="user-1")
+    client = _client()
+    client.require_consent = True
+    session = SimpleNamespace(save=AsyncMock())
+    handle = AsyncMock(
+        return_value=RedirectResponse("ir.getmirza.flow:/oauth?code=xyz")
+    )
+    covers = AsyncMock(return_value=covered)
+    with (
+        patch.object(routes, "get_tenant", new=AsyncMock(return_value=tenant)),
+        patch.object(
+            routes,
+            "validate_authorization_request",
+            new=AsyncMock(return_value=(client, scopes)),
+        ),
+        patch.object(
+            routes.dependencies,
+            "get_current_user_optional",
+            new=AsyncMock(return_value=user),
+        ),
+        patch.object(routes.UserConsent, "covers", new=covers),
+        patch.object(
+            routes.OAuthSession, "get_by_state", new=AsyncMock(return_value=None)
+        ),
+        patch.object(routes, "_handle_authorized_user", new=handle),
+        patch.object(
+            routes.OAuthSession, "create_session", return_value=session
+        ) as create_session,
+    ):
+        response = await routes.authorize(
+            _request(),
+            ResponseType.CODE,
+            "client-1",
+            "https://client.test/callback",
+            " ".join(scopes),
+            "state_1234567890123456",
+            None,
+            "S256",
+            None,
+            None,
+            None,
+        )
+    return response, handle, covers, create_session
+
+
+@pytest.mark.asyncio
+async def test_authorize_requires_consent_on_first_login() -> None:
+    response, handle, covers, create_session = await _authorize_with_stored_consent(
+        covered=False, scopes=["openid"]
+    )
+    assert response.headers["location"].startswith("https://frontend.test/consent")
+    handle.assert_not_awaited()
+    create_session.assert_called_once()
+    covers.assert_awaited_once_with("tenant-1", "user-1", "client-1", ["openid"])
+
+
+@pytest.mark.asyncio
+async def test_authorize_skips_consent_when_already_granted() -> None:
+    response, handle, _, create_session = await _authorize_with_stored_consent(
+        covered=True, scopes=["openid"]
+    )
+    assert response.headers["location"] == "ir.getmirza.flow:/oauth?code=xyz"
+    handle.assert_awaited_once()
+    create_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_authorize_requires_reconsent_when_scopes_increase() -> None:
+    response, handle, _, _ = await _authorize_with_stored_consent(
+        covered=False, scopes=["openid", "write"]
+    )
+    assert response.headers["location"].startswith("https://frontend.test/consent")
+    handle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_authorize_prompt_consent_ignores_stored_consent() -> None:
+    tenant = _tenant()
+    user = SimpleNamespace(uid="user-1")
+    client = _client()
+    client.require_consent = True
+    covers = AsyncMock(return_value=True)
+    with (
+        patch.object(routes, "get_tenant", new=AsyncMock(return_value=tenant)),
+        patch.object(
+            routes,
+            "validate_authorization_request",
+            new=AsyncMock(return_value=(client, ["openid"])),
+        ),
+        patch.object(
+            routes.dependencies,
+            "get_current_user_optional",
+            new=AsyncMock(return_value=user),
+        ),
+        patch.object(routes.UserConsent, "covers", new=covers),
+        patch.object(
+            routes.OAuthSession, "get_by_state", new=AsyncMock(return_value=None)
+        ),
+        patch.object(
+            routes.OAuthSession,
+            "create_session",
+            return_value=SimpleNamespace(save=AsyncMock()),
+        ),
+    ):
+        response = await routes.authorize(
+            _request(),
+            ResponseType.CODE,
+            "client-1",
+            "https://client.test/callback",
+            "openid",
+            "state_1234567890123456",
+            None,
+            "S256",
+            None,
+            "consent",
+            None,
+        )
+    assert response.headers["location"].startswith("https://frontend.test/consent")
+    covers.assert_not_awaited()

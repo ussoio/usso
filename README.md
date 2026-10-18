@@ -146,10 +146,16 @@ docker compose up -d
 
 ## Tests
 
+Run tests inside Docker on the authorized test server. The OAuth lifecycle
+regression uses isolated MongoDB/Redis testcontainers and the suite's test login;
+it does not use a production account. It covers public registration, approval
+and denial, PKCE, code reuse, refresh rotation, and token revocation.
+
 ```bash
 cd app
-/Users/mahdi/venv/bin/pytest tests/unit -q
-/Users/mahdi/venv/bin/ruff check .
+uv run pytest tests/unit -q
+uv run pytest --no-cov tests/integration/test_mcp_oauth_lifecycle.py -q
+uv run ruff check .
 ```
 
 ## License

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from asyncio import sleep
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+REFERRAL_REGISTERED_EVENT = "referral_registered"
 REFERRAL_USED_EVENT = "referral.used"
 USER_CREATED_EVENT = "user.created"
 
@@ -120,23 +122,55 @@ def extract_referral_code(raw: str | None) -> str | None:
     return parts[-1] if parts else None
 
 
+# Rewards ride on these calls, so a brief outage of the receiver must not lose
+# them. In-process retry only: a restart drops pending retries.
+WEBHOOK_ATTEMPTS = 4
+WEBHOOK_BACKOFF_SECONDS = 2.0
+
+
+def _is_transient(exc: Exception) -> bool:
+    """Retry network errors, timeouts, 5xx and 429; never other client errors."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status >= 500 or status == 429
+    return isinstance(exc, httpx.TransportError)
+
+
 async def _post_webhook(
     *,
     url: str,
     headers: dict[str, str] | None,
     payload: dict,
 ) -> None:
-    try:
-        await validate_public_url(url)
-        async with httpx.AsyncClient(
-            timeout=10.0,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await client.post(url, json=payload, headers=headers or {})
-            response.raise_for_status()
-    except Exception:
-        logger.exception("Referral webhook failed for %s", url)
+    for attempt in range(1, WEBHOOK_ATTEMPTS + 1):
+        try:
+            await validate_public_url(url)
+            async with httpx.AsyncClient(
+                timeout=10.0,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                response = await client.post(url, json=payload, headers=headers or {})
+                response.raise_for_status()
+        except Exception as exc:
+            if attempt == WEBHOOK_ATTEMPTS or not _is_transient(exc):
+                logger.exception(
+                    "Webhook failed for %s (attempt %d/%d)",
+                    url,
+                    attempt,
+                    WEBHOOK_ATTEMPTS,
+                )
+                return
+            logger.warning(
+                "Webhook to %s failed (attempt %d/%d): %s; retrying",
+                url,
+                attempt,
+                WEBHOOK_ATTEMPTS,
+                exc,
+            )
+            await sleep(WEBHOOK_BACKOFF_SECONDS * 3 ** (attempt - 1))
+        else:
+            return
 
 
 _webhook_tasks: set[asyncio.Task] = set()
@@ -173,6 +207,16 @@ def on_referral_registration(
     invitee: User,
 ) -> None:
     """Notify configured webhooks after a successful invited registration."""
+    dispatch_tenant_webhooks(
+        tenant=tenant,
+        event=REFERRAL_REGISTERED_EVENT,
+        payload={
+            "tenant_id": tenant.uid,
+            "referrer_user_id": referral.user_id,
+            "invitee_user_id": invitee.uid,
+            "referral_code": referral.code,
+        },
+    )
     body = {
         "tenant_id": tenant.uid,
         "referral_code": referral.code,

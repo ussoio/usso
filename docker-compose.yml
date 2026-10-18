@@ -2,25 +2,25 @@ services:
   app:
     build: app
     restart: unless-stopped
-    container_name: usso-io-app
+    # command: ["python", "-m" ,"debugpy", "--listen", "0.0.0.0:3000", "-m", "main"]
+    # ports:
+    #   - 3000:3000
     hostname: ${PROJECT_NAME}
     env_file:
       - .env
+    environment:
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-172.18.0.0/16}
     networks:
       - traefik-net
       - mongo-net
     labels:
       - "traefik.enable=true"
-      # HTTP → HTTPS redirect
-      - "traefik.http.middlewares.${PROJECT_NAME}-https.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.${PROJECT_NAME}-https.redirectscheme.permanent=true"
-      # HTTP router (redirect only)
       - "traefik.http.routers.${PROJECT_NAME}.entrypoints=web"
+      # - "traefik.http.routers.${PROJECT_NAME}.rule=Host(`${DOMAIN}`)"
       - "traefik.http.routers.${PROJECT_NAME}.rule=(${DOMAINS}) && (PathPrefix(`/api`) || PathPrefix(`/.well-known`))"
       - "traefik.http.routers.${PROJECT_NAME}.priority=100"
-      - "traefik.http.routers.${PROJECT_NAME}.middlewares=${PROJECT_NAME}-https"
-      # HTTPS router
       - "traefik.http.routers.${PROJECT_NAME}-secure.entrypoints=websecure"
+      # - "traefik.http.routers.${PROJECT_NAME}-secure.rule=Host(`${DOMAIN}`)"
       - "traefik.http.routers.${PROJECT_NAME}-secure.rule=(${DOMAINS}) && (PathPrefix(`/api`) || PathPrefix(`/.well-known`))"
       - "traefik.http.routers.${PROJECT_NAME}-secure.priority=100"
       - "traefik.http.routers.${PROJECT_NAME}-secure.tls=true"

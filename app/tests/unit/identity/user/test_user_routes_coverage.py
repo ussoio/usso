@@ -11,11 +11,21 @@ import pytest
 from apps.identity.auth.enums import AuthIdentifier, AuthSecret, LoginStatus
 from apps.identity.user import routes, schemas
 from server.exceptions import (
+    AccountAlreadyExistsError,
     AlreadyExistsError,
     BadRequestError,
     ForbiddenError,
     NotFoundError,
 )
+
+
+@pytest.fixture(autouse=True)
+def _guard() -> Iterator[AsyncMock]:
+    """Stub the higher-access guard; test_manageable_user.py covers it."""
+    with patch.object(
+        routes.services, "assert_manageable_user", new=AsyncMock()
+    ) as guard:
+        yield guard
 
 
 def _request() -> MagicMock:
@@ -68,6 +78,7 @@ def _identifier(
         "is_primary": False,
         "is_active": True,
         "searchable": True,
+        "meta_data": None,
     }
     return SimpleNamespace(
         **data,
@@ -372,11 +383,13 @@ async def test_create_user_reports_existing_or_registration_failure(
         patch.object(
             routes.services, "assert_assignable_tenant_roles", new=AsyncMock()
         ),
-        pytest.raises(BadRequestError) as exc,
+        pytest.raises(
+            BadRequestError if not existing else AccountAlreadyExistsError
+        ) as exc,
     ):
         await router.create_item(request, data)
     assert exc.value.error_code == (
-        "user_already_exists" if existing else "registration_failed"
+        "account_already_exists" if existing else "registration_failed"
     )
 
 
@@ -413,6 +426,25 @@ async def test_update_user_propagates_global_and_workspace_permissions() -> None
         call(workspace_id="ws-personal"),
         call(workspace_id="ws-1"),
     ])
+
+
+@pytest.mark.asyncio
+async def test_deactivate_user_revokes_all_sessions() -> None:
+    """Deactivation is an immediate sign-out: every live session is deleted."""
+    router = routes.UserRouter()
+    updated = _target()
+    sessions = MagicMock()
+    sessions.update_many = AsyncMock()
+    with (
+        _configure_target_router(router),
+        patch.object(router.model, "update_item", new=AsyncMock(return_value=updated)),
+        patch.object(routes.models.AuthSession, "find", return_value=sessions) as find,
+    ):
+        data = schemas.UserUpdateSchema(is_active=False)
+        assert await router.update_item(_request(), "user-1", data) == "detailed"
+    find.assert_called_once_with({"user_id": "user-1", "is_deleted": False})
+    sessions.update_many.assert_awaited_once_with({"$set": {"is_deleted": True}})
+    updated.update_permissions_and_sessions.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1164,3 +1196,242 @@ async def test_credential_router_registration_success_and_failure() -> None:
         )
     assert totp_result.uid == "credential-1"
     verify_totp.assert_awaited_once()
+
+
+def _service_caller() -> SimpleNamespace:
+    caller = _caller()
+    caller.scopes = ["manage:sso/usso/user"]
+    return caller
+
+
+@pytest.mark.asyncio
+async def test_user_change_requires_an_authenticated_actor() -> None:
+    with pytest.raises(ForbiddenError):
+        await routes.UserRouter()._authorize_user_change(
+            action="update", user=None, target=SimpleNamespace()
+        )
+
+
+@pytest.mark.parametrize(
+    ("typ", "scopes", "expected"),
+    [
+        (AuthIdentifier.BALE_ID, ["manage:sso/usso/user"], True),
+        (AuthIdentifier.TELEGRAM_ID, ["admin:sso/usso/user"], True),
+        (AuthIdentifier.BALE_ID, [], False),
+        (AuthIdentifier.BALE_ID, ["read:sso/usso/user"], False),
+        (AuthIdentifier.EMAIL, ["manage:sso/usso/user"], False),
+        (AuthIdentifier.PHONE, ["manage:sso/usso/user"], False),
+    ],
+)
+def test_is_trusted_messenger_link(
+    typ: AuthIdentifier, scopes: list[str], expected: bool
+) -> None:
+    caller = SimpleNamespace(scopes=scopes)
+    assert (
+        routes.services.is_trusted_messenger_link(identifier_type=typ, caller=caller)
+        is expected
+    )
+    assert (
+        routes.services.is_trusted_messenger_link(identifier_type=typ, caller=None)
+        is False
+    )
+
+
+async def _create_bale_identifier(
+    caller: SimpleNamespace, existing: object | None = None
+) -> tuple[MagicMock, object]:
+    router = routes.UserRouter()
+    created = _identifier(typ=AuthIdentifier.BALE_ID, value="12345")
+    identifier_cls = MagicMock(return_value=created)
+    identifier_cls.find_one = AsyncMock(return_value=existing)
+    with (
+        patch.object(router, "get_user", new=AsyncMock(return_value=caller)),
+        patch.object(
+            router,
+            "get_tenant",
+            new=AsyncMock(return_value=SimpleNamespace(uid="tenant-1")),
+        ),
+        patch.object(router, "get_item", new=AsyncMock(return_value=_target())),
+        patch.object(router, "authorize", new=AsyncMock()),
+        patch.object(routes.models, "UserIdentifier", identifier_cls),
+    ):
+        result = await router.create_identifier(
+            _request(),
+            "user-1",
+            schemas.UserIdentifierCreateSchema(
+                type=AuthIdentifier.BALE_ID, identifier="12345"
+            ),
+        )
+    return identifier_cls, result
+
+
+@pytest.mark.asyncio
+async def test_create_identifier_verifies_bale_linked_by_service_account() -> None:
+    identifier_cls, _ = await _create_bale_identifier(_service_caller())
+    assert isinstance(identifier_cls.call_args.kwargs["verified_at"], datetime)
+
+
+@pytest.mark.asyncio
+async def test_create_identifier_keeps_self_added_bale_unverified() -> None:
+    identifier_cls, _ = await _create_bale_identifier(_caller())
+    assert identifier_cls.call_args.kwargs["verified_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_identifier_heals_existing_unverified_bale_link() -> None:
+    existing = _identifier(typ=AuthIdentifier.BALE_ID, value="12345")
+    with pytest.raises(AlreadyExistsError):
+        await _create_bale_identifier(_service_caller(), existing=existing)
+    assert isinstance(existing.verified_at, datetime)
+    existing.save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_identifier_does_not_heal_other_users_bale_link() -> None:
+    existing = _identifier(typ=AuthIdentifier.BALE_ID, value="12345", user_id="other")
+    with pytest.raises(AlreadyExistsError):
+        await _create_bale_identifier(_service_caller(), existing=existing)
+    assert existing.verified_at is None
+    existing.save.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_user_by_service_account_verifies_bale_identifier() -> None:
+    router = routes.UserRouter()
+    primary = _identifier(typ=AuthIdentifier.BALE_ID, value="12345")
+    created = _target(current_identifier=primary)
+    data = schemas.UserCreateSchema(
+        identifier="12345", identifier_type=AuthIdentifier.BALE_ID
+    )
+    with (
+        patch.object(
+            router,
+            "get_tenant",
+            new=AsyncMock(return_value=SimpleNamespace(uid="tenant-1")),
+        ),
+        patch.object(router, "get_user", new=AsyncMock(return_value=_service_caller())),
+        patch.object(router, "authorize", new=AsyncMock()),
+        patch.object(routes.services, "find_user", new=AsyncMock(return_value=None)),
+        patch.object(
+            routes.services, "create_user", new=AsyncMock(return_value=created)
+        ),
+        patch.object(
+            routes.services, "assert_assignable_tenant_roles", new=AsyncMock()
+        ),
+        patch.object(routes.services, "upsert_admin_profile", new=AsyncMock()),
+        patch.object(routes.services, "upsert_admin_kyc", new=AsyncMock()),
+    ):
+        await router.create_item(_request(), data)
+    assert isinstance(primary.verified_at, datetime)
+    primary.save.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("current", "incoming", "expected"),
+    [
+        (None, None, None),
+        (None, {"username": "@Ali_99"}, {"username": "Ali_99"}),
+        ({"username": "old"}, {"username": "new"}, {"username": "new"}),
+        ({"username": "old", "x": 1}, {"username": ""}, {"x": 1}),
+        ({"username": "old"}, {"username": None}, None),
+        ({"username": "old"}, {"username": "bad name!"}, {"username": "old"}),
+        ({"username": "old"}, {"other": "ignored"}, {"username": "old"}),
+    ],
+)
+def test_apply_messenger_profile(
+    current: dict | None, incoming: dict | None, expected: dict | None
+) -> None:
+    assert (
+        routes.services.apply_messenger_profile(current=current, incoming=incoming)
+        == expected
+    )
+
+
+async def _create_bale_with_meta(
+    caller: SimpleNamespace,
+    meta_data: dict | None,
+    existing: object | None = None,
+) -> MagicMock:
+    router = routes.UserRouter()
+    identifier_cls = MagicMock(
+        return_value=_identifier(typ=AuthIdentifier.BALE_ID, value="12345")
+    )
+    identifier_cls.find_one = AsyncMock(return_value=existing)
+    with (
+        patch.object(router, "get_user", new=AsyncMock(return_value=caller)),
+        patch.object(
+            router,
+            "get_tenant",
+            new=AsyncMock(return_value=SimpleNamespace(uid="tenant-1")),
+        ),
+        patch.object(router, "get_item", new=AsyncMock(return_value=_target())),
+        patch.object(router, "authorize", new=AsyncMock()),
+        patch.object(routes.models, "UserIdentifier", identifier_cls),
+    ):
+        await router.create_identifier(
+            _request(),
+            "user-1",
+            schemas.UserIdentifierCreateSchema(
+                type=AuthIdentifier.BALE_ID, identifier="12345", meta_data=meta_data
+            ),
+        )
+    return identifier_cls
+
+
+@pytest.mark.asyncio
+async def test_create_identifier_stores_messenger_username_for_trusted_bot() -> None:
+    identifier_cls = await _create_bale_with_meta(
+        _service_caller(), {"username": "@ali"}
+    )
+    assert identifier_cls.call_args.kwargs["meta_data"] == {"username": "ali"}
+
+
+@pytest.mark.asyncio
+async def test_create_identifier_ignores_meta_data_from_untrusted_caller() -> None:
+    identifier_cls = await _create_bale_with_meta(_caller(), {"username": "ali"})
+    assert identifier_cls.call_args.kwargs["meta_data"] is None
+
+
+@pytest.mark.asyncio
+async def test_relink_refreshes_username_on_verified_identifier() -> None:
+    existing = _identifier(typ=AuthIdentifier.BALE_ID, value="12345")
+    verified_at = datetime(2026, 1, 1)
+    existing.verified_at = verified_at
+    existing.meta_data = {"username": "old"}
+    with pytest.raises(AlreadyExistsError):
+        await _create_bale_with_meta(
+            _service_caller(), {"username": "new"}, existing=existing
+        )
+    assert existing.meta_data == {"username": "new"}
+    assert existing.verified_at == verified_at
+    existing.save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_relink_without_changes_does_not_save() -> None:
+    existing = _identifier(typ=AuthIdentifier.BALE_ID, value="12345")
+    existing.verified_at = datetime(2026, 1, 1)
+    existing.meta_data = {"username": "same"}
+    with pytest.raises(AlreadyExistsError):
+        await _create_bale_with_meta(
+            _service_caller(), {"username": "same"}, existing=existing
+        )
+    existing.save.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_checks_target_access_and_granted_scopes(
+    _guard: AsyncMock,
+) -> None:
+    router = routes.UserRouter()
+    with (
+        _configure_target_router(router) as (caller, target),
+        patch.object(
+            router.model,
+            "update_item",
+            new=AsyncMock(return_value=_target(workspace_ids=[])),
+        ),
+    ):
+        data = schemas.UserUpdateSchema(scopes=["read:x"])
+        await router.update_item(_request(), "user-1", data)
+    _guard.assert_awaited_once_with(actor=caller, target=target, new_scopes=["read:x"])

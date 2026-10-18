@@ -21,6 +21,11 @@ from ..auth.enums import AuthIdentifier, AuthSecret, AuthStep
 logger = logging.getLogger(__name__)
 
 
+def _legacy_searchable_to_default(value: object) -> object:
+    """Legacy documents stored text in ``searchable``; use the default."""
+    return value if isinstance(value, bool) or value is None else True
+
+
 class ActivationStatus(StrEnum):
     """User activation status enumeration."""
 
@@ -55,6 +60,11 @@ class UserIdentifierSchema(TenantUserEntitySchema):
         default=True,
         description="Whether this identifier may appear in user search results",
     )
+
+    @field_validator("searchable", mode="before")
+    @classmethod
+    def _coerce_legacy_searchable(cls, value: object) -> object:
+        return _legacy_searchable_to_default(value)
 
     @property
     def redis_key(self) -> str:
@@ -151,6 +161,13 @@ class UserIdentifierCreateSchema(BaseModel):
     type: AuthIdentifier
     identifier: str
     is_primary: bool = False
+    meta_data: dict | None = Field(
+        default=None,
+        description=(
+            "Messenger profile data, e.g. {'username': 'name'}. "
+            "Stored only for messenger ids linked by a trusted service."
+        ),
+    )
 
 
 class UserIdentifierUpdateSchema(BaseModel):
@@ -197,6 +214,11 @@ class UserSchema(TenantScopedEntitySchema):
         default=True,
         description="Whether this user may appear in workspace user search",
     )
+
+    @field_validator("searchable", mode="before")
+    @classmethod
+    def _coerce_legacy_searchable(cls, value: object) -> object:
+        return _legacy_searchable_to_default(value)
 
     avatar_url: str | None = None
 

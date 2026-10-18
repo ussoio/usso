@@ -6,8 +6,20 @@ user creation, authentication, credential management, and user lookup.
 """
 
 import asyncio
+import logging
+import re
+from collections.abc import Awaitable, Iterator
+from contextlib import contextmanager
 from datetime import date, datetime
+from typing import Any, cast
 
+from fastapi_mongo_base.audit.context import (
+    AuditActor,
+    bind_audit_actor,
+    reset_audit_actor,
+)
+from fastapi_mongo_base.audit.emit import maybe_record_audit
+from fastapi_mongo_base.audit.schemas import AuditAction
 from fastapi_mongo_base.utils import timezone
 from fastapi_mongo_base.utils.mongo_aggregate import aggregate_to_list
 from usso import UserData, authorization
@@ -29,6 +41,8 @@ from ..auth.schemas import (
     Secret,
 )
 from .models import Credential, User, UserIdentifier
+
+logger = logging.getLogger(__name__)
 
 
 async def assert_assignable_tenant_roles(
@@ -88,6 +102,51 @@ async def assert_assignable_tenant_roles(
                 )
 
 
+async def assert_manageable_user(
+    *,
+    actor: UserData,
+    target: User,
+    new_scopes: list[str] | None = None,
+) -> None:
+    """
+    Block changes to a user whose access the editor does not fully hold.
+
+    "Higher" means the target has at least one scope (direct or via tenant
+    roles) the actor's scopes do not cover. Users may still edit themselves.
+    ``new_scopes`` are raw scopes being granted; each must be covered too.
+    """
+    actor_scopes = list(actor.scopes or [])
+    for scope in new_scopes or []:
+        if not authorization.has_subset_scope(
+            subset_scope=scope, user_scopes=actor_scopes
+        ):
+            raise ForbiddenError(
+                error_code="scope_insufficient",
+                detail=f"You cannot grant scope you lack: {scope}",
+                message={
+                    "en": "You cannot grant access you do not have.",
+                    "fa": "نمی‌توانید دسترسی‌ای را بدهید که خودتان ندارید.",
+                },
+            )
+    if target.uid == (actor.user_id or actor.uid):
+        return
+    for scope in await target.get_scopes() or []:
+        if not authorization.has_subset_scope(
+            subset_scope=scope, user_scopes=actor_scopes
+        ):
+            raise ForbiddenError(
+                error_code="target_user_privileged",
+                detail=f"Target user holds scope the actor lacks: {scope}",
+                message={
+                    "en": "You cannot change a user with higher access than yours.",
+                    "fa": (
+                        "سطح دسترسی این کاربر از شما بالاتر است و "
+                        "امکان تغییر آن را ندارید."
+                    ),
+                },
+            )
+
+
 async def upsert_admin_profile(
     *,
     user: User,
@@ -123,8 +182,32 @@ async def upsert_admin_profile(
     await profile.save()
 
 
+async def _admin_civil_inquiry(national_code: str, birth_date: date) -> dict | None:
+    """
+    Ask the civil registry about an admin-entered national ID + birth date.
+
+    A mismatch is raised to the admin; an unavailable registry only skips the
+    data so the account can still be saved.
+    """
+    from apps.identity.kyc import services as kyc_services
+    from server.exceptions import ServiceUnavailableError
+    from utils.validators import validate_date_for_sahmsi
+
+    try:
+        data = await cast(
+            Awaitable[dict],
+            kyc_services.verify_civil(
+                national_code, validate_date_for_sahmsi(birth_date)
+            ),
+        )
+    except ServiceUnavailableError:
+        logger.warning("civil registry unavailable; admin KYC saved without it")
+        return None
+    return data or None
+
+
 async def upsert_admin_kyc(*, user: User, birth_date: date | None) -> None:
-    """Persist administrator-provided birth date in the user's KYC record."""
+    """Persist administrator-provided birth date and civil data in the KYC record."""
     if birth_date is None:
         return
     national = await UserIdentifier.find_one({
@@ -140,6 +223,12 @@ async def upsert_admin_kyc(*, user: User, birth_date: date | None) -> None:
         "tenant_id": user.tenant_id,
         "is_deleted": False,
     })
+    civil_data = await _admin_civil_inquiry(national.identifier, birth_date)
+    civil_fields: dict[str, Any] = (
+        {"civil_data": civil_data, "civil_verified_at": datetime.now(timezone.tz)}
+        if civil_data
+        else {}
+    )
     if kyc is None:
         await KYC(
             tenant_id=user.tenant_id,
@@ -147,12 +236,31 @@ async def upsert_admin_kyc(*, user: User, birth_date: date | None) -> None:
             national_code=national.identifier,
             birth_date=birth_date,
             status=KYCStatus.APPROVED,
+            **civil_fields,
         ).save()
     else:
         kyc.national_code = national.identifier
         kyc.birth_date = birth_date
         kyc.status = KYCStatus.APPROVED
+        for key, value in civil_fields.items():
+            setattr(kyc, key, value)
         await kyc.save()
+
+    await _sync_names_from_civil(user, civil_data)
+
+
+async def _sync_names_from_civil(user: User, civil_data: dict | None) -> None:
+    """Civil data is authoritative: fill profile names; fill a blank display name."""
+    from apps.identity.kyc.services import civil_name_parts
+
+    first_name, last_name = civil_name_parts(civil_data)
+    if not (first_name or last_name):
+        return
+    await upsert_admin_profile(user=user, first_name=first_name, last_name=last_name)
+    display_name = " ".join(part for part in (first_name, last_name) if part)
+    if display_name and not user.name:
+        user.name = display_name
+        await user.save()
 
 
 def validate_totp(*, secret: str, code: str) -> bool:
@@ -242,13 +350,14 @@ async def find_user(
     if not result:
         return None
 
-    identifier: dict = result[0].get("identifier", {})
-    user_identifier = UserIdentifier(**identifier)
-    user = User(**identifier.get("user"))
-    user.tenant = tenant or Tenant(**identifier.get("tenant"))
+    identifier_record: dict = result[0].get("identifier", {})
+    user_identifier = UserIdentifier(**identifier_record)
+    user = User(**(identifier_record.get("user") or {}))
+    user.tenant = tenant or Tenant(**(identifier_record.get("tenant") or {}))
     user.current_identifier = user_identifier
     user.credentials = [
-        Credential(**credential) for credential in identifier.get("credentials", [])
+        Credential(**credential)
+        for credential in identifier_record.get("credentials", [])
     ]
     return user
 
@@ -401,6 +510,42 @@ async def authenticate_user(*, user: User, secret: Secret, **kwargs: object) -> 
     return False
 
 
+@contextmanager
+def self_registration_audit_scope(user: User) -> Iterator[None]:
+    """Bind the newly created user as audit actor for self-registration."""
+    actor = AuditActor(
+        tenant_id=user.tenant_id,
+        user_id=user.uid,
+        sub_type="self_registration",
+        principal_id=user.uid,
+    )
+    token = bind_audit_actor(actor)
+    try:
+        yield
+    finally:
+        reset_audit_actor(token)
+
+
+@contextmanager
+def bootstrap_audit_scope(*, tenant_id: str) -> Iterator[None]:
+    """Bind a bootstrap actor for first-tenant or setup user creation."""
+    actor = AuditActor(
+        tenant_id=tenant_id,
+        sub_type="bootstrap",
+        principal_id="bootstrap",
+    )
+    token = bind_audit_actor(actor)
+    try:
+        yield
+    finally:
+        reset_audit_actor(token)
+
+
+async def record_user_created(user: User) -> None:
+    """Persist a create audit row for ``user`` when auditing is enabled."""
+    await maybe_record_audit(action=AuditAction.create, item=user)
+
+
 async def add_credential(*, user: User, secret: Secret) -> User:
     """
     Add a credential to a user.
@@ -439,13 +584,23 @@ async def add_credential(*, user: User, secret: Secret) -> User:
     return user
 
 
-async def create_user(*, login: LoginRequest, tenant: Tenant, **kwargs: object) -> User:
+async def create_user(
+    *,
+    login: LoginRequest,
+    tenant: Tenant,
+    record_audit: bool = True,
+    audit_as_self: bool = False,
+    **kwargs: object,
+) -> User:
     """
     Create a new user with login credentials.
 
     Args:
         login: Login request containing identifier and secret.
         tenant: Tenant to create user in.
+        record_audit: When True, emit a create audit row after persistence.
+        audit_as_self: When True, attribute creation to the new user
+            (self-registration) instead of a bound admin actor.
         **kwargs: Additional keyword arguments (e.g., name, is_active).
 
     Returns:
@@ -503,7 +658,67 @@ async def create_user(*, login: LoginRequest, tenant: Tenant, **kwargs: object) 
 
         await ensure_personal_workspace(user=user)
 
+    if record_audit:
+        if audit_as_self:
+            with self_registration_audit_scope(user):
+                await record_user_created(user)
+        else:
+            await record_user_created(user)
+
     return user
+
+
+# Messenger user ids are delivered by the messenger's own servers in signed
+# bot updates (``from.id``), so a trusted bot that links one has already proven
+# ownership. This matches how Telegram Login verifies ``telegram_id``.
+MESSENGER_IDENTIFIER_TYPES = frozenset({
+    AuthIdentifier.TELEGRAM_ID,
+    AuthIdentifier.BALE_ID,
+})
+
+
+def is_trusted_messenger_link(
+    *, identifier_type: AuthIdentifier, caller: UserData | None
+) -> bool:
+    """
+    Return True when a messenger identifier is linked by a trusted service.
+
+    Only callers that can manage users (e.g. the bot's service account) may
+    vouch for a messenger id. A user adding a messenger id to their own
+    account through the API proves nothing and stays unverified.
+    """
+    if identifier_type not in MESSENGER_IDENTIFIER_TYPES or caller is None:
+        return False
+    return authorization.check_access(
+        user_scopes=caller.scopes or [],
+        resource_path="sso/usso/user",
+        action="manage",
+    )
+
+
+_MESSENGER_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+
+def apply_messenger_profile(
+    *, current: dict | None, incoming: dict | None
+) -> dict | None:
+    """
+    Merge messenger profile data into an identifier's ``meta_data``.
+
+    Only ``username`` is accepted. A leading ``@`` is stripped and invalid
+    values are ignored. An explicit empty value removes the stored username,
+    because messenger users can delete or change their public username.
+    """
+    if not incoming or "username" not in incoming:
+        return current
+    merged = dict(current or {})
+    raw = incoming.get("username")
+    username = str(raw).strip().removeprefix("@") if raw else ""
+    if not username:
+        merged.pop("username", None)
+    elif _MESSENGER_USERNAME_RE.fullmatch(username):
+        merged["username"] = username
+    return merged or None
 
 
 def needs_verification(
@@ -564,7 +779,11 @@ async def find_or_create_user(
             },
         )
 
-    user = await create_user(login=login_request, tenant=tenant)
+    user = await create_user(
+        login=login_request,
+        tenant=tenant,
+        audit_as_self=True,
+    )
     return user, True
 
 

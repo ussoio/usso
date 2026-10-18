@@ -1,6 +1,6 @@
 """KYC schemas."""
 
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 
 from fastapi_mongo_base.schemas import TenantUserEntitySchema
@@ -55,6 +55,9 @@ class KYCSchema(TenantUserEntitySchema, KYCCreateSchema):
         default=KYCStatus.PENDING, description="The status of the KYC."
     )
     civil_data: dict | None = None
+    # When the registries confirmed the data (civil = ثبت احوال, phone = شاهکار).
+    civil_verified_at: datetime | None = None
+    phone_verified_at: datetime | None = None
 
 
 class CreateKycResponse(BaseModel):

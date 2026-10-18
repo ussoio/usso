@@ -15,6 +15,8 @@ from fastapi_mongo_base.utils import basic
 from testcontainers.community.redis import RedisContainer
 
 # Settings fields are read at import time — set test defaults before app imports.
+# Tests must not send events to production Sentry.
+os.environ["SENTRY_DSN"] = ""
 for _key, _value in (
     ("PROJECT_NAME", "usso"),
     ("SYSTEM_PASSWORD", "test-system-password-at-least-32-bytes"),
@@ -145,10 +147,27 @@ async def mongo_client() -> AsyncGenerator[object]:
 
 async def init_db(mongo_client: object) -> None:
     """Async setup function to initialize the database with Beanie."""
+    from fastapi_mongo_base.audit.context import set_audit_enabled
+    from fastapi_mongo_base.audit.models import AuditLog, activate_mongo_audit_log
+
+    os.environ.setdefault("AUDIT_LOG_ENABLED", "true")
+    activate_mongo_audit_log()
+    set_audit_enabled(True)
+
+    document_models = [
+        cls
+        for cls in basic.get_all_subclasses(models.BaseEntity)
+        if not (
+            "Settings" in cls.__dict__ and getattr(cls.Settings, "__abstract__", False)
+        )
+    ]
+    if AuditLog not in document_models:
+        document_models = [*document_models, AuditLog]
+
     database = mongo_client.get_database("test_db")
     await init_beanie(
         database=database,
-        document_models=basic.get_all_subclasses(models.BaseEntity),
+        document_models=document_models,
     )
 
 

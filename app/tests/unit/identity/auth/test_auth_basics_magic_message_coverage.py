@@ -1,6 +1,7 @@
 """Coverage for auth URL, magic-link, and remaining messaging branches."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -393,6 +394,24 @@ async def test_schedule_background_task_runs_and_discards_task() -> None:
     await asyncio.sleep(0)
     assert completed == ["done"]
     assert not message_services._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_schedule_background_task_logs_exceptions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def boom() -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError("otp_send_failed")
+
+    with caplog.at_level(logging.ERROR):
+        message_services._schedule_background_task(boom())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    assert not message_services._background_tasks
+    assert any("Background messaging task failed" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,13 @@ from ..user.models import User
 from . import models, schemas, services
 
 
+def _self_service_scopes(tenant: object) -> list[str]:
+    config = getattr(tenant, "config", None)
+    integration = getattr(config, "integration", None)
+    api_key = getattr(integration, "api_key", None)
+    return list(getattr(api_key, "self_service_scopes", None) or [])
+
+
 class APIKeyRouter(AbstractTenantUSSORouter):
     """API key router."""
 
@@ -37,7 +44,22 @@ class APIKeyRouter(AbstractTenantUSSORouter):
 
     def config_routes(self, **kwargs: object) -> None:
         """Configure routes."""
+        # Register before the base routes so `/scopes` is not captured by `/{uid}`.
+        self.router.add_api_route(
+            "/scopes",
+            self.grantable_scopes,
+            methods=["GET"],
+            response_model=schemas.APIKeyScopesSchema,
+            status_code=200,
+        )
         super().config_routes(update_route=False, **kwargs)
+        self.router.add_api_route(
+            "/{uid:str}",
+            self.update_item,
+            methods=["PATCH"],
+            response_model=self.schema,
+            status_code=200,
+        )
         self.router.add_api_route(
             "/verify",
             self.verify,
@@ -45,6 +67,31 @@ class APIKeyRouter(AbstractTenantUSSORouter):
             dependencies=[Depends(get_rate_limiter("/apikeys/verify"))],
             response_model=self.verify_response_schema,
             status_code=200,
+        )
+
+    async def grantable_scopes(self, request: Request) -> schemas.APIKeyScopesSchema:
+        """Scopes the caller may grant to an API key bound to themselves."""
+        tenant = await self.get_tenant(request)
+        caller = await self.get_user(request)
+        caller_user = await User.get_item(uid=caller.uid, tenant_id=tenant.uid)
+        if caller_user is None:
+            from server.exceptions import UnauthorizedError
+
+            raise UnauthorizedError(
+                error_code="user_not_found",
+                detail="User not found",
+                message={"en": "User not found.", "fa": "کاربر پیدا نشد."},
+            )
+        self_service = _self_service_scopes(tenant)
+        scopes = await resolve_scope_ceiling(
+            caller_user=caller_user,
+            user_id=caller_user.uid,
+            workspace_id=None,
+            self_service_scopes=self_service,
+        )
+        return schemas.APIKeyScopesSchema(
+            scopes=scopes,
+            self_service_scopes=[s for s in self_service if s in scopes],
         )
 
     def _to_response(self, item: models.APIKey) -> schemas.APIKeyResponseSchema:
@@ -97,6 +144,7 @@ class APIKeyRouter(AbstractTenantUSSORouter):
             caller_user=caller_user,
             user_id=user_id,
             workspace_id=workspace_id,
+            self_service_scopes=_self_service_scopes(tenant),
         )
         assert_scopes_subset(requested=data.scopes, ceiling=ceiling)
 
@@ -117,6 +165,7 @@ class APIKeyRouter(AbstractTenantUSSORouter):
             ip_whitelist=data.ip_whitelist,
             rate_limit=data.rate_limit,
             expires_at=data.expires_at,
+            spend_limit=data.spend_limit,
             hashed_client_secret=hashed_client_secret,
             **key_data,
         ).save()
@@ -127,6 +176,20 @@ class APIKeyRouter(AbstractTenantUSSORouter):
             "api_key": api_key_plaintext,
             "client_secret": client_secret,
         })
+
+    async def update_item(
+        self, request: Request, uid: str, data: schemas.APIKeyUpdateSchema
+    ) -> schemas.APIKeyResponseSchema:
+        """Update an API key's name, description or spend limit."""
+        tenant = await self.get_tenant(request)
+        caller = await self.get_user(request)
+        require_secure_token(request=request, tenant=tenant, user_id=caller.uid)
+        item = await self.get_item(uid=uid, user_id=caller.uid, tenant_id=tenant.uid)
+        for field, value in data.model_dump(exclude_unset=True).items():
+            setattr(item, field, value)
+        await item.save()
+        await services.invalidate_api_key_cache(uid=uid)
+        return self._to_response(item)
 
     async def delete_item(
         self, request: Request, uid: str

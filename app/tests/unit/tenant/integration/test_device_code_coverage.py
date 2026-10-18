@@ -100,9 +100,7 @@ def test_raise_if_not_ready_consumed_or_naively_expired(consumed: bool) -> None:
     # Naive expires_at is treated as timezone.tz (UTC); keep wall clock in UTC.
     now_utc = datetime.now(timezone.tz).replace(tzinfo=None)
     expires = (
-        now_utc + timedelta(minutes=5)
-        if consumed
-        else now_utc - timedelta(seconds=1)
+        now_utc + timedelta(minutes=5) if consumed else now_utc - timedelta(seconds=1)
     )
     with pytest.raises(BadRequestError) as exc:
         dc.raise_if_not_ready(_auth(is_consumed=consumed, expires_at=expires))

@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from fastapi_mongo_base.audit.models import AuditLog
 
 from apps.identity.user import routes
 from apps.identity.user.models import User
@@ -49,6 +50,15 @@ async def test_create_user(authenticated_client: httpx.AsyncClient) -> None:
     logging.info(f"{resp_json}")
     assert response.status_code == 201
 
+    audit_rows = await AuditLog.find({
+        "resource_type": "User",
+        "resource_uid": resp_json["uid"],
+        "action": "create",
+    }).to_list()
+    assert len(audit_rows) == 1
+    assert audit_rows[0].actor_sub_type == "user"
+    assert audit_rows[0].actor_user_id is not None
+
 
 @pytest.mark.asyncio
 async def test_list_users(authenticated_client: httpx.AsyncClient) -> None:
@@ -75,6 +85,15 @@ async def test_update_user(
     logging.info(f"{resp_json}")
     assert response.status_code == 200
     assert resp_json["name"] == "test_update_user"
+
+    audit_rows = await AuditLog.find({
+        "resource_type": "User",
+        "resource_uid": uid,
+        "action": "update",
+    }).to_list()
+    assert audit_rows
+    assert audit_rows[-1].changes is not None
+    assert "name" in audit_rows[-1].changes
 
     response = await authenticated_client.get(f"/users/{uid}")
     resp_json: dict = response.json()

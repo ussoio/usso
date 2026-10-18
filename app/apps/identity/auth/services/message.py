@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Coroutine
 from datetime import datetime, timedelta
 
-from fastapi_mongo_base.utils import basic, timezone
+from fastapi_mongo_base.utils import timezone
 
 from server.config import Settings
 from server.exceptions import TooManyRequestsError
@@ -40,7 +40,20 @@ _background_tasks: set[asyncio.Task[object]] = set()
 def _schedule_background_task(coro: Coroutine[object, object, object]) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    def _done(done: asyncio.Task[object]) -> None:
+        _background_tasks.discard(done)
+        if done.cancelled():
+            return
+        exc = done.exception()
+        if exc is not None:
+            logger.exception(
+                "Background messaging task failed: %s",
+                type(exc).__name__,
+                exc_info=exc,
+            )
+
+    task.add_done_callback(_done)
 
 
 async def send_magic_link(
@@ -106,9 +119,13 @@ async def send_magic_link(
     )
 
 
-@basic.debug_mode_mock(return_value=123456)
 def _generate_random_otp(length: int) -> int:
-    """Generate an OTP with a CSPRNG in every environment."""
+    """
+    Generate an OTP with a CSPRNG in every environment.
+
+    Never mock this with a fixed value: a DEBUG flag left on in production
+    turned every OTP into 123456 (account takeover).
+    """
     return secrets.randbelow(10**length)
 
 

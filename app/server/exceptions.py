@@ -15,6 +15,7 @@ from fastapi_mongo_base.errors import (
 )
 
 __all__ = [
+    "AccountAlreadyExistsError",
     "AlreadyExistsError",
     "BadRequestError",
     "ConflictError",
@@ -25,6 +26,20 @@ __all__ = [
     "ResourceLockedError",
     "UnauthorizedError",
 ]
+
+
+class AccountAlreadyExistsError(AlreadyExistsError):
+    """
+    Another account already holds this phone, national ID, email or username.
+
+    One message for every identifier type, so callers cannot probe which one
+    is registered.
+    """
+
+    status_code = 409
+    error_code = "account_already_exists"
+    message_en = "Another account with the entered information already exists."
+    message_fa = "حساب کاربری دیگری با اطلاعات وارد شده از قبل وجود دارد."
 
 
 class TooManyRequestsError(BaseHTTPException):

@@ -6,6 +6,7 @@ This module initializes and runs the FastAPI server with graceful shutdown handl
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -30,6 +31,8 @@ async def main() -> None:
         f"{module}:app",
         host="0.0.0.0",  # ruff:ignore[hardcoded-bind-all-interfaces]
         port=8000,
+        proxy_headers=True,
+        forwarded_allow_ips=os.getenv("FORWARDED_ALLOW_IPS", "*"),
         access_log=True,
         workers=1,
         log_config=Settings.get_log_config(),

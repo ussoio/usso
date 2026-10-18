@@ -12,11 +12,11 @@ from collections.abc import Callable
 
 import redis
 from fastapi import Request, Response
-from fastapi_limiter.callback import default_callback
 from fastapi_limiter.depends import RateLimiter
 from pyrate_limiter import Duration, Limiter, Rate, RedisBucket
 
 from server.db import redis as redis_client
+from server.exceptions import TooManyRequestsError
 from utils.net import get_client_ip
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,9 @@ logger = logging.getLogger(__name__)
 # Rate limit constants (matching your existing configuration)
 RATE_LIMIT_WINDOW = 60  # 1 minute window
 MAX_REQUESTS = {
-    "/auth": 10,  # 10 attempts per minute for all auth endpoints
+    # Shared by every /auth endpoint (incl. refresh) per client; 10 was hit
+    # by normal use (page loads + OAuth round trips).
+    "/auth": 30,
     # "/auth/login": 5,  # 5 attempts per minute for login
     "/auth/magic-link": 0.2,  # 1 attempts per minute for magic link
     "/auth/request-magic-link": 0.1,  # 1 attempts per minute for magic link
@@ -33,13 +35,20 @@ MAX_REQUESTS = {
     "/auth/qr": 1,  # 10 attempts per minute for QR code generation
     "/auth/passkey": 5,  # 1 attempts per minute for passkey generation
     "/oauth/token": 10,
-    "/agents/auth": 10,
+    # Open RFC 7591 registration for MCP agents; creates DB rows unauthenticated.
+    "/oauth/register": 10,
+    # Service-to-service token exchange. Every accounting/IPG call from shop,
+    # saas and the bot fetches a token, and all of them reach USSO from the
+    # same CDN edge address, so they share one bucket; 10/min returned 429 on
+    # a normal checkout. The endpoint only accepts a JWT signed by the agent's
+    # own key, so guessing is not the risk this limit has to cover.
+    "/agents/auth": 300,
     "/setup": 5,
     "/users/identifier-verification": 5,
     "/users/impersonation-otp": 5,
     "/kyc": 5,
     # "/captcha/challenge": 3,  # 3 attempts per minute for captcha challenge
-    "default": 30,  # 60 requests per minute for other endpoints
+    "default": 60,  # requests per minute for other endpoints
 }
 
 _limiters: dict[tuple[int, int], Limiter] = {}
@@ -117,6 +126,27 @@ def generate_fingerprint(request: Request) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+_RATE_LIMIT_FA_HEAD = "درخواست‌های زیادی ارسال شده است. "
+_RATE_LIMIT_FA_TAIL = " ثانیه دیگر دوباره تلاش کنید."
+
+
+def rate_limited_callback(retry_after: int) -> Callable[..., object]:
+    """Build a 429 callback with a localized message and ``retry_after``."""
+
+    async def callback(request: Request, response: Response) -> None:  # ruff:ignore[unused-async]
+        del request, response
+        raise TooManyRequestsError(
+            detail="Too many requests",
+            message={
+                "en": f"Too many attempts. Try again in {retry_after} seconds.",
+                "fa": _RATE_LIMIT_FA_HEAD + str(retry_after) + _RATE_LIMIT_FA_TAIL,
+            },
+            retry_after=retry_after,
+        )
+
+    return callback
+
+
 def get_identifier(path: str, auth_required: bool) -> Callable[[Request], str]:
     """
     Create an identifier function for rate limiting.
@@ -157,7 +187,7 @@ class PathRateLimiter(RateLimiter):
         super().__init__(
             limiter=_limiters.get(self._config) or Limiter(self._fallback_rate),
             identifier=get_identifier(path, auth_required),
-            callback=default_callback,
+            callback=rate_limited_callback(time_window),
             blocking=False,
         )
 

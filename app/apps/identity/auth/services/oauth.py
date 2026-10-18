@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
+import re
 import secrets
 import urllib.parse
 from typing import Any
 
 import httpx
 from aiocache import cached
+from fastapi import Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import URL
 from usso_jwt.config import JWTConfig
@@ -46,6 +50,8 @@ from .telegram import (
     telegram_display_name,
     telegram_user_id_from_claims,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class OAuthSession(BaseModel):
@@ -162,6 +168,60 @@ def sanitize_return_url(return_url: str | None, tenant: Tenant) -> str | None:
     return return_url
 
 
+OAUTH_COOKIES = (
+    "usso_oidc_state",
+    "usso_oidc_verifier",
+    "usso_oidc_nonce",
+    "usso_oauth_return_url",
+    "usso_oauth_handoff",
+    "usso_oauth_step_up",
+)
+_OAUTH_BROWSER_PATH = re.compile(r"/auth/oauth/[^/]+/(authorize|callback)/?$")
+
+
+async def oauth_error_redirect(
+    request: Request, error_code: str, retry_after: object = None
+) -> RedirectResponse | None:
+    """
+    Send a browser OAuth failure back to the app instead of raw JSON.
+
+    authorize/callback are full-page navigations, so a JSON error leaves the
+    user on a blank page. Redirect to the sanitized return URL with
+    ``auth_error`` (and ``retry_after``) so the sign-in page can explain it.
+    """
+    match = _OAUTH_BROWSER_PATH.search(request.url.path)
+    if request.method != "GET" or not match:
+        return None
+
+    from ....tenant.services import get_request_tenant
+
+    try:
+        tenant = await get_request_tenant(request)
+    except Exception:
+        return None
+
+    raw_return_url = (
+        request.query_params.get("return_url")
+        if match.group(1) == "authorize"
+        else request.cookies.get("usso_oauth_return_url")
+    )
+    return_url = sanitize_return_url(raw_return_url, tenant) or sanitize_return_url(
+        tenant.config.default_redirect_url, tenant
+    )
+    if not return_url:
+        return None
+
+    params = {"auth_error": error_code}
+    if retry_after:
+        params["retry_after"] = str(retry_after)
+    response = RedirectResponse(
+        build_url_with_params(return_url, params), status_code=303
+    )
+    for cookie in OAUTH_COOKIES:
+        response.delete_cookie(cookie)
+    return response
+
+
 def _pkce_pair() -> tuple[str, str]:
     """Return (code_verifier, code_challenge) for S256 PKCE."""
     code_verifier = secrets.token_urlsafe(64)
@@ -218,10 +278,47 @@ def resolve_provider_secret(tenant: Tenant, provider: str) -> OAuthSecret:
     return secrets_data
 
 
+OAUTH_STEP_UP_MAX_AGE_SECONDS = 300
+
+
+def supports_oauth_step_up(provider: str, secrets_data: OAuthSecret | None) -> bool:
+    """
+    Return True when re-login with this provider may issue a secure token.
+
+    Policy: only OTP and passkey open a secure session. OAuth re-login is
+    disabled for every provider: Google often skips the fresh login (no
+    ``auth_time``), and Telegram cannot force one at all.
+    """
+    del provider, secrets_data
+    return False
+
+
+def is_fresh_oauth_authentication(
+    userinfo: dict[str, Any],
+    *,
+    now: int,
+    max_age: int = OAUTH_STEP_UP_MAX_AGE_SECONDS,
+) -> bool:
+    """Return True when the id_token proves auth within ``max_age`` seconds."""
+    auth_time = userinfo.get("auth_time")
+    if isinstance(auth_time, bool) or not isinstance(auth_time, int | float):
+        return False
+    return 0 <= now - int(auth_time) <= max_age
+
+
 async def create_oauth_session(
-    *, tenant: Tenant, provider: str, url: URL | str | None = None
+    *,
+    tenant: Tenant,
+    provider: str,
+    url: URL | str | None = None,
+    step_up: bool = False,
 ) -> OAuthSession:
-    """Create an OAuth session and return authorize URL + state (+ PKCE)."""
+    """
+    Create an OAuth session and return authorize URL + state (+ PKCE).
+
+    ``step_up`` forces a fresh provider login (``prompt=login``, ``max_age=0``)
+    so the callback can issue a secure token from proven, recent auth.
+    """
     secrets_data = resolve_provider_secret(tenant, provider)
     oidc_config = await fetch_oidc_config(secrets_data.discovery_url)
     client_id = secrets_data.client_id
@@ -242,6 +339,9 @@ async def create_oauth_session(
         "state": state,
         "nonce": nonce,
     }
+    if step_up:
+        params["prompt"] = "login"
+        params["max_age"] = "0"
     code_verifier: str | None = None
     if use_pkce:
         code_verifier, code_challenge = _pkce_pair()
@@ -292,9 +392,45 @@ async def exchange_oauth_code_for_userinfo(
         data["code_verifier"] = code_verifier
 
     async with httpx.AsyncClient(proxy=os.getenv("PROXY")) as client:
-        resp = await client.post(token_endpoint, data=data, headers=headers, timeout=10)
-        resp.raise_for_status()
-        token_response = resp.json()
+        try:
+            resp = await client.post(
+                token_endpoint, data=data, headers=headers, timeout=10
+            )
+            resp.raise_for_status()
+            token_response = resp.json()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            # Log only the OAuth error fields (RFC 6749 §5.2), never tokens.
+            try:
+                body = exc.response.json() if exc.response is not None else {}
+            except ValueError:
+                body = {}
+            logger.warning(
+                "OIDC token exchange failed: provider=%s status=%s error=%s "
+                "description=%s redirect_uri=%s",
+                provider,
+                status,
+                body.get("error") if isinstance(body, dict) else None,
+                body.get("error_description") if isinstance(body, dict) else None,
+                redirect_uri,
+            )
+            raise BadRequestError(
+                error_code="oauth_token_exchange_failed",
+                detail=f"OIDC token endpoint returned HTTP {status}",
+                message={
+                    "en": "Login with this provider failed. Please try again.",
+                    "fa": "ورود با این سرویس ناموفق بود. دوباره تلاش کنید.",
+                },
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise BadRequestError(
+                error_code="oauth_token_exchange_failed",
+                detail=f"OIDC token endpoint error: {type(exc).__name__}",
+                message={
+                    "en": "Login with this provider failed. Please try again.",
+                    "fa": "ورود با این سرویس ناموفق بود. دوباره تلاش کنید.",
+                },
+            ) from exc
 
     issuer = oidc_config.get("issuer")
     if not isinstance(issuer, str) or not issuer:

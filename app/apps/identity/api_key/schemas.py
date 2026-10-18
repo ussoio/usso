@@ -40,6 +40,23 @@ class APIKeyCreateSchema(BaseModel):
         ),
     )
     expires_at: datetime | None = None
+    spend_limit: float | None = Field(
+        None,
+        ge=0,
+        description="Maximum total spend for this key. None means unlimited.",
+    )
+
+
+class APIKeyUpdateSchema(BaseModel):
+    """API key update schema (only the fields sent are changed)."""
+
+    name: str | None = None
+    description: str | None = None
+    spend_limit: float | None = Field(
+        None,
+        ge=0,
+        description="Maximum total spend for this key. null removes the limit.",
+    )
 
 
 class APIKeySchema(APIKeyCreateSchema, TenantScopedEntitySchema):
@@ -62,6 +79,11 @@ class APIKeySchema(APIKeyCreateSchema, TenantScopedEntitySchema):
     usage_count: int = Field(
         0,
         description="The number of times the API key has been used.",
+    )
+    spend_usage: float = Field(
+        0.0,
+        ge=0,
+        description="Total spend recorded against this key.",
     )
     last_ip: str | None = Field(
         None,
@@ -97,6 +119,8 @@ class APIKeyResponseSchema(TenantScopedEntitySchema):
     last_used_at: datetime | None = None
     usage_count: int = 0
     rate_limit: dict = Field(default_factory=dict)
+    spend_limit: float | None = None
+    spend_usage: float = 0.0
 
 
 class APIKeyCreateResponseSchema(APIKeyResponseSchema):
@@ -106,6 +130,16 @@ class APIKeyCreateResponseSchema(APIKeyResponseSchema):
     client_secret: str = Field(
         ...,
         description="OAuth client_secret for /oauth/token (shown once)",
+    )
+
+
+class APIKeyScopesSchema(BaseModel):
+    """Scopes the caller may grant to a self-bound API key."""
+
+    scopes: list[str] = Field(default_factory=list)
+    self_service_scopes: list[str] = Field(
+        default_factory=list,
+        description="Subset of scopes granted to every user by tenant config.",
     )
 
 

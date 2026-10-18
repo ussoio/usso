@@ -135,9 +135,7 @@ async def test_create_workspace_routes_child_and_does_not_divert_admin() -> None
 @pytest.mark.asyncio
 async def test_create_workspace_provision_creates_without_membership() -> None:
     """Tenant-catalog provision does not add the caller to workspace_ids."""
-    item = WorkspaceSchema(
-        tenant_id="tenant-1", name="Acme", organization_code="103"
-    )
+    item = WorkspaceSchema(tenant_id="tenant-1", name="Acme", organization_code="103")
     user = SimpleNamespace(uid="user-1")
     workspace = SimpleNamespace(uid="ws-1")
     with (

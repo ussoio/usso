@@ -1,6 +1,6 @@
 [project]
 name = "usso-server"
-version = "0.3.19"
+version = "0.4.1"
 description = "USSO: A Secure, Multi-Tenant SSO Platform for modern SaaS and microservice architectures."
 # readme = "README.md"
 requires-python = ">=3.13"

@@ -116,10 +116,7 @@ def telegram_user_id_from_claims(claims: dict[str, Any]) -> str:
             ),
         }
     else:
-        detail = (
-            "Telegram id_token missing numeric user id claim "
-            f"(keys={claim_keys})"
-        )
+        detail = f"Telegram id_token missing numeric user id claim (keys={claim_keys})"
         message = {
             "en": "Telegram login data is invalid.",
             "fa": "داده ورود تلگرام نامعتبر است.",

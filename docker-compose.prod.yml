@@ -13,6 +13,8 @@ services:
     hostname: ${PROJECT_NAME}
     env_file:
       - .env
+    environment:
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:?Set the trusted proxy CIDR}
     networks:
       - traefik-net
       - mongo-net

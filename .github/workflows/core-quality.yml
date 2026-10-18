@@ -1,0 +1,35 @@
+name: Core quality
+
+on:
+  pull_request:
+    branches: [main, pure, ice]
+  push:
+    branches: [main, pure, ice]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install Python and locked dependencies
+        working-directory: app
+        run: |
+          uv python install 3.13
+          uv sync --frozen --group dev
+      - name: Lint and format
+        working-directory: app
+        run: |
+          uv run ruff check --no-fix .
+          uv run ruff format --check .
+      - name: Type-check deployment and tracing boundaries
+        working-directory: app
+        run: uv run mypy server/extensions.py utils/tracing.py --follow-imports=skip
+      - name: Test core and registered overlays
+        working-directory: app
+        run: uv run pytest
+      - name: Build runtime image
+        run: docker build -t usso-quality-check app

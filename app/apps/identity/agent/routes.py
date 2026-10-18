@@ -122,7 +122,8 @@ class AgentRouter(AbstractTenantUSSORouter):
         """Authenticate an agent."""
         tenant = await self.get_tenant(request)
 
-        logger.info("Agent auth request: %s", request.headers)
+        # Never log the headers: Authorization carries the agent's signed JWT.
+        logger.info("Agent auth request: host=%s", request.headers.get("host"))
 
         jwt = request.headers.get("Authorization")
         if not jwt or not jwt.startswith("Bearer "):

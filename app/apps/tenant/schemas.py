@@ -12,8 +12,6 @@ from fastapi_mongo_base.schemas import UserOwnedEntitySchema
 from pydantic import BaseModel, Field, field_validator
 from usso_jwt.enums import Algorithm
 
-from server.config import Settings
-
 from .config import TenantConfig, TenantFrontendURLConfig
 
 
@@ -207,7 +205,7 @@ class TenantRetrieveSchema(UserOwnedEntitySchema):
         frontend_endpoint = getattr(self.frontend_urls, route)
         if frontend_endpoint.startswith("http"):
             return frontend_endpoint
-        return f"{self.primary_url}{Settings.base_path}{frontend_endpoint}"
+        return f"{self.primary_url}{frontend_endpoint}"
 
     # Custom JWT Payload
     custom_payload: dict | None = Field(

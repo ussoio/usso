@@ -94,7 +94,8 @@ class TestOIDCConfig:
         # Check supported response types
         assert "response_types_supported" in data
         assert data["response_types_supported"] == ["code"]
-        assert "none" not in data["token_endpoint_auth_methods_supported"]
+        # "none" is advertised for public (PKCE) clients such as device-code apps.
+        assert "none" in data["token_endpoint_auth_methods_supported"]
 
         # Check supported subject types
         assert data["subject_types_supported"] == ["public"]

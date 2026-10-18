@@ -5,6 +5,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from usso.user import TokenType, UserData
+from usso.utils import validators as identifier_validators
 
 from ..session.schemas import SessionType
 from ..user.models import User
@@ -141,6 +142,29 @@ class Identifier(BaseModel):
         max_length=512,
         description="Identifier value (email, phone, username, etc.)",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_identifier_input(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+
+        data = dict(value)
+        raw_identifier = data.get("identifier")
+        if not isinstance(raw_identifier, str):
+            return data
+
+        normalized = identifier_validators.convert_to_english_digits(
+            raw_identifier
+        ).strip()
+        data["identifier"] = normalized
+        identifier_type = data.get("type")
+        if identifier_type in (None, AuthIdentifier.USERNAME, "username"):
+            valid, _, canonical = identifier_validators.validate_phone(normalized, "IR")
+            if valid and canonical:
+                data["type"] = AuthIdentifier.PHONE
+                data["identifier"] = canonical
+        return data
 
     @model_validator(mode="after")
     def validate_identifier(self) -> Self:

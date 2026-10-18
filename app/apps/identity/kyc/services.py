@@ -36,16 +36,25 @@ def _civil_payload(civil_data: dict[str, Any] | None) -> dict[str, Any]:
     return civil_data
 
 
+_ARABIC_TO_PERSIAN = str.maketrans({"ي": "ی", "ك": "ک", "ى": "ی"})
+
+
+def _persian_name(value: object) -> str | None:
+    """Strip and store names with Persian ی/ک (the registry returns Arabic ي/ك)."""
+    if value is None:
+        return None
+    text = str(value).translate(_ARABIC_TO_PERSIAN).strip()
+    return text or None
+
+
 def civil_name_parts(
     civil_data: dict[str, Any] | None,
 ) -> tuple[str | None, str | None]:
     """Extract first/last name from a civil-registry payload."""
     data = _civil_payload(civil_data)
-    first = data.get("firstName") or data.get("first_name")
-    last = data.get("lastName") or data.get("last_name")
     return (
-        str(first).strip() or None if first is not None else None,
-        str(last).strip() or None if last is not None else None,
+        _persian_name(data.get("firstName") or data.get("first_name")),
+        _persian_name(data.get("lastName") or data.get("last_name")),
     )
 
 

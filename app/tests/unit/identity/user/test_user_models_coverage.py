@@ -217,8 +217,46 @@ async def test_get_credentials_filters_expiry_and_uses_cache() -> None:
         user_id="user-1",
         is_deleted=False,
         is_active=True,
-        method=AuthSecret.PASSWORD,
     )
+
+
+@pytest.mark.asyncio
+async def test_get_credentials_cache_hit_still_filters_method() -> None:
+    """Regression: a phone OTP preloaded by find_user must not pass as a password."""
+    user = _user()
+    now = datetime.now(timezone.tz)
+    password = SimpleNamespace(
+        method=AuthSecret.PASSWORD, expires_at=None, is_active=True, is_deleted=False
+    )
+    otp = SimpleNamespace(
+        method=AuthSecret.PHONE_OTP,
+        expires_at=now + timedelta(minutes=2),
+        is_active=True,
+        is_deleted=False,
+    )
+    used_otp = SimpleNamespace(
+        method=AuthSecret.PHONE_OTP,
+        expires_at=now + timedelta(minutes=2),
+        is_active=False,
+        is_deleted=False,
+    )
+    expired_otp = SimpleNamespace(
+        method=AuthSecret.PHONE_OTP,
+        expires_at=now - timedelta(seconds=1),
+        is_active=True,
+        is_deleted=False,
+    )
+    deleted = SimpleNamespace(
+        method=AuthSecret.PASSWORD, expires_at=None, is_active=True, is_deleted=True
+    )
+    # find_user fills the cache with every row, unfiltered.
+    user.credentials = [password, otp, used_otp, expired_otp, deleted]
+
+    with patch.object(models.Credential, "get_query") as get:
+        assert await user.get_credentials(AuthSecret.PASSWORD) == [password]
+        assert await user.get_credentials(AuthSecret.PHONE_OTP) == [otp]
+        assert await user.get_credentials() == [password, otp]
+    get.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -442,7 +480,9 @@ async def test_hard_delete_cascades_belongings_and_sole_workspaces() -> None:
 
     sole_ws = SimpleNamespace(uid="ws-sole")
     shared_ws = SimpleNamespace(uid="ws-shared")
-    user = _user(workspace_ids=["ws-sole", "ws-shared"], workspace_roles={"ws-sole": ["owner"]})
+    user = _user(
+        workspace_ids=["ws-sole", "ws-shared"], workspace_roles={"ws-sole": ["owner"]}
+    )
 
     def total_count(**kwargs: object) -> int:
         workspace_ids_in = kwargs.get("workspace_ids_in") or []
@@ -669,3 +709,34 @@ def test_user_queryset_filters_by_workspace_ids_in() -> None:
         empty = models.User.get_queryset(tenant_id="tenant-1", workspace_ids_in=[])
     assert query["workspace_ids"] == {"$in": ["ws-1", "ws-2"]}
     assert empty["workspace_ids"] == {"$in": []}
+
+
+@pytest.mark.asyncio
+async def test_drop_legacy_identifier_index_only_drops_full_unique() -> None:
+    from apps.identity.user import models as user_models
+
+    collection = MagicMock()
+    collection.drop_index = AsyncMock()
+    with patch.object(
+        user_models.UserIdentifier, "get_pymongo_collection", return_value=collection
+    ):
+        collection.index_information = AsyncMock(
+            return_value={user_models.LEGACY_IDENTIFIER_INDEX: {"unique": True}},
+        )
+        assert await user_models.drop_legacy_identifier_index() is True
+        collection.drop_index.assert_awaited_once_with(
+            user_models.LEGACY_IDENTIFIER_INDEX,
+        )
+
+        collection.drop_index.reset_mock()
+        collection.index_information = AsyncMock(return_value={})
+        assert await user_models.drop_legacy_identifier_index() is False
+        collection.index_information = AsyncMock(
+            return_value={
+                user_models.LEGACY_IDENTIFIER_INDEX: {
+                    "partialFilterExpression": {"is_deleted": False},
+                },
+            },
+        )
+        assert await user_models.drop_legacy_identifier_index() is False
+        collection.drop_index.assert_not_awaited()

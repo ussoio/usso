@@ -17,13 +17,19 @@ from apps.access_control.role.models import Role
 from apps.identity.auth import enums as auth_enums
 from apps.identity.auth.schemas import LoginRequest
 from apps.identity.user.models import User, UserIdentifier
-from apps.identity.user.services import create_user
+from apps.identity.user.services import (
+    bootstrap_audit_scope,
+    create_user,
+    record_user_created,
+)
 from apps.tenant.config import (
     AgentConfig,
     AuthenticationConfig,
     TenantConfig,
     WorkspaceConfig,
 )
+from apps.tenant.integration.models import OAuthClient
+from apps.tenant.integration.schemas import ClientType, GrantType, Scope
 from apps.tenant.keys import TenantKey
 from apps.tenant.messaging.schemas import TenantChannelConfig
 from apps.tenant.models import Tenant
@@ -34,6 +40,7 @@ from server.config import Settings
 logger = logging.getLogger(__name__)
 
 _BOOTSTRAP_LOG_PREFIX = "[USSO bootstrap]"
+_PUBLIC_CLIENT_AUTH_METHOD = "none"
 
 
 def _log_bootstrap_skip(reason: str, *, details: str | None = None) -> None:
@@ -289,9 +296,7 @@ async def create_first_tenant() -> Tenant | None:
     )
     from apps.identity.auth.pass_validator import validate_password_policy
 
-    password_policy = validate_password_policy(
-        superadmin_password, tenant_config.auth
-    )
+    password_policy = validate_password_policy(superadmin_password, tenant_config.auth)
     password_ok = password_policy.is_valid
     if not password_ok:
         # Weak env password must not block tenant creation — only skip setting it.
@@ -317,24 +322,81 @@ async def create_first_tenant() -> Tenant | None:
     _configure_channels_from_env(tenant)
     _configure_oauth_from_env(tenant)
 
-    user = await create_user(
-        name=os.getenv("SUPERADMIN_NAME", "Admin"),
-        login=LoginRequest(
-            type=auth_enums.AuthIdentifier.EMAIL,
-            identifier=superadmin_email,
-            method=auth_enums.AuthSecret.PASSWORD if password_ok else None,
-            secret=superadmin_password if password_ok else None,
-        ),
-        tenant=tenant,
-        is_active=True,
-    )
+    with bootstrap_audit_scope(tenant_id=tenant.uid):
+        user = await create_user(
+            name=os.getenv("SUPERADMIN_NAME", "Admin"),
+            login=LoginRequest(
+                type=auth_enums.AuthIdentifier.EMAIL,
+                identifier=superadmin_email,
+                method=auth_enums.AuthSecret.PASSWORD if password_ok else None,
+                secret=superadmin_password if password_ok else None,
+            ),
+            tenant=tenant,
+            is_active=True,
+            record_audit=False,
+        )
 
-    user_identifiers = _bootstrap_superadmin_identifiers(
-        user,
-        superadmin_username=superadmin_username,
-    )
-    await _persist_first_tenant(tenant, user, user_identifiers)
+        user_identifiers = _bootstrap_superadmin_identifiers(
+            user,
+            superadmin_username=superadmin_username,
+        )
+        await _persist_first_tenant(tenant, user, user_identifiers)
+        await record_user_created(user)
+
     await _run_after_first_tenant_hooks(tenant)
 
     _log_bootstrap_success(tenant)
     return tenant
+
+
+def _public_client_from_env() -> dict | None:
+    """
+    Read an optional bootstrap public OAuth client (device-code) from env.
+
+    Deployment-specific clients (e.g. a browser extension) are configured per
+    instance instead of being hardcoded in core.
+    """
+    client_id = os.getenv("BOOTSTRAP_PUBLIC_CLIENT_ID", "").strip()
+    if not client_id:
+        return None
+    redirect_uris = [
+        uri.strip()
+        for uri in os.getenv("BOOTSTRAP_PUBLIC_CLIENT_REDIRECT_URIS", "").split(",")
+        if uri.strip()
+    ]
+    return {
+        "client_id": client_id,
+        "client_name": (
+            os.getenv("BOOTSTRAP_PUBLIC_CLIENT_NAME", "").strip() or client_id
+        ),
+        "redirect_uris": redirect_uris,
+    }
+
+
+async def ensure_bootstrap_public_client() -> None:
+    """Provision the env-configured public OAuth client on every tenant once."""
+    spec = _public_client_from_env()
+    if spec is None:
+        return
+    client_id = spec["client_id"]
+    tenants = await Tenant.find({"is_deleted": False}).to_list()
+    for tenant in tenants:
+        client = await OAuthClient.find_one({
+            "tenant_id": tenant.uid,
+            "client_id": client_id,
+            "is_deleted": False,
+        })
+        if client is None:
+            await OAuthClient(
+                client_id=client_id,
+                client_secret=None,
+                client_name=spec["client_name"],
+                client_type=ClientType.PUBLIC,
+                redirect_uris=spec["redirect_uris"],
+                allowed_scopes=[Scope.OPENID, Scope.PROFILE, Scope.READ, Scope.WRITE],
+                grant_types=[GrantType.DEVICE_CODE],
+                tenant_id=tenant.uid,
+                user_id=tenant.user_id,
+                token_endpoint_auth_method=_PUBLIC_CLIENT_AUTH_METHOD,
+            ).save()
+            logger.info("Provisioned public OAuth client %s", client_id)

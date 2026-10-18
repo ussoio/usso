@@ -614,3 +614,44 @@ async def test_process_login_flow_requires_user_mfa_after_main_flow() -> None:
 
     assert result.status == LoginStatus.MFA_REQUIRED
     assert result.next_step == mfa_step
+
+
+@pytest.mark.asyncio
+async def test_activation_dispatches_user_activated_webhook_once() -> None:
+    user = _user()
+    tenant = _tenant(approval_mode="identifier")
+    with (
+        patch.object(
+            flow, "verify_identifier", new_callable=AsyncMock, return_value=True
+        ),
+        patch.object(flow, "dispatch_tenant_webhooks") as dispatch,
+    ):
+        assert await flow.activate_user_if_eligible(
+            user=user, tenant=tenant, login_request=_request()
+        )
+        # A second login finds the user active and must not fire the event again.
+        assert await flow.activate_user_if_eligible(
+            user=user, tenant=tenant, login_request=_request()
+        )
+
+    dispatch.assert_called_once()
+    kwargs = dispatch.call_args.kwargs
+    assert kwargs["event"] == "user.activated"
+    assert kwargs["payload"]["user_id"] == user.uid
+    assert kwargs["payload"]["tenant_id"] == tenant.uid
+
+
+@pytest.mark.asyncio
+async def test_failed_activation_does_not_dispatch_webhook() -> None:
+    with (
+        patch.object(
+            flow, "verify_identifier", new_callable=AsyncMock, return_value=False
+        ),
+        patch.object(flow, "dispatch_tenant_webhooks") as dispatch,
+    ):
+        assert not await flow.activate_user_if_eligible(
+            user=_user(),
+            tenant=_tenant(approval_mode="identifier"),
+            login_request=_request(),
+        )
+    dispatch.assert_not_called()

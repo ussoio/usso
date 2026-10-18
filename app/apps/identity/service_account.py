@@ -109,12 +109,14 @@ async def resolve_scope_ceiling(
     caller_user: User,
     user_id: str | None,
     workspace_id: str | None,
+    self_service_scopes: list[str] | None = None,
 ) -> list[str]:
     """
     Scopes the service account may be granted.
 
     - user + workspace → that user's effective scopes on the workspace
-    - user only → that user's tenant-wide scopes
+    - user only → that user's tenant-wide scopes, plus the tenant's
+      self-service API scopes when the key is bound to the caller themselves
     - workspace only → caller's effective scopes on the workspace
     """
     if user_id is not None:
@@ -125,7 +127,10 @@ async def resolve_scope_ceiling(
                 detail="User not found",
                 message={"en": "User not found.", "fa": "کاربر پیدا نشد."},
             )
-        return list(await target.get_effective_scopes_for_api(workspace_id) or [])
+        scopes = list(await target.get_effective_scopes_for_api(workspace_id) or [])
+        if workspace_id is None and user_id == caller_user.uid:
+            scopes.extend(s for s in self_service_scopes or [] if s not in scopes)
+        return scopes
 
     return list(await caller_user.get_effective_scopes_for_api(workspace_id) or [])
 

@@ -143,7 +143,8 @@ async def test_existing_user_does_not_consume_referral(
             },
         )
 
-    assert response.status_code == 400
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "account_already_exists"
     reloaded = await ReferralCode.get_by_code(
         code=referral.code,
         tenant_id=initial_tenant.uid,

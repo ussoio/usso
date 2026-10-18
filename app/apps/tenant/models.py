@@ -238,3 +238,35 @@ class Tenant(TenantRetrieveSchema, UserOwnedEntity):
     def secure_auth(self) -> USSOAuthentication:
         """USSO authentication for secure session tokens (HMAC)."""
         return self.get_auth("secure", raise_exception=False)
+
+    @staticmethod
+    def _has_request_credentials(auth: USSOAuthentication, request: object) -> bool:
+        return (
+            auth.get_request_jwt(request) is not None
+            or auth.get_request_api_key(request) is not None
+        )
+
+    def optional_user(
+        self, request: object, token_type: str | None = None
+    ) -> object | None:
+        """
+        Return user data only if a token/API key is present.
+
+        Missing credentials must NOT call usso_access_security, so the
+        usso library cannot logger.error("No token provided").
+        """
+        resolved_type = token_type or "temporary"
+        auth = self.get_auth(resolved_type, raise_exception=False)
+        if not self._has_request_credentials(auth, request):
+            return None
+        return auth(request)
+
+    async def optional_user_async(
+        self, request: object, token_type: str | None = None
+    ) -> object | None:
+        """Return user data asynchronously only if a token/API key is present."""
+        resolved_type = token_type or "temporary"
+        auth = self.get_auth(resolved_type, raise_exception=False)
+        if not self._has_request_credentials(auth, request):
+            return None
+        return await auth.usso_access_security_async(request)
