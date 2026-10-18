@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -33,10 +34,20 @@ def _script(
 async def _post() -> None:
     with (
         patch.object(referral, "validate_public_url", new=AsyncMock()),
-        patch.object(referral.asyncio, "sleep", new=AsyncMock()) as sleep,
+        patch.object(referral, "sleep", new=AsyncMock()) as sleep,
     ):
         await referral._post_webhook(url=URL, headers=None, payload={"a": 1})
     _post.sleeps = [c.args[0] for c in sleep.await_args_list]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_retry_wait_mock_preserves_global_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_sleep = asyncio.sleep
+    _script(monkeypatch, [503, 200])
+    await _post()
+    assert asyncio.sleep is original_sleep
 
 
 @pytest.mark.asyncio

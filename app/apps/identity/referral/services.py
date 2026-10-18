@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from asyncio import sleep
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -167,7 +168,7 @@ async def _post_webhook(
                 WEBHOOK_ATTEMPTS,
                 exc,
             )
-            await asyncio.sleep(WEBHOOK_BACKOFF_SECONDS * 3 ** (attempt - 1))
+            await sleep(WEBHOOK_BACKOFF_SECONDS * 3 ** (attempt - 1))
         else:
             return
 
