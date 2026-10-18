@@ -46,6 +46,14 @@ async def get_jwks_pem(
     )
 
 
+@router.get("/.well-known/oauth-authorization-server")
+async def get_oauth_authorization_server_metadata(
+    request: Request,
+) -> dict[str, str | list[str] | bool]:
+    """RFC 8414 metadata so MCP agents can discover and register themselves."""
+    return await get_openid_configuration(request)
+
+
 @router.get("/.well-known/openid-configuration")
 async def get_openid_configuration(
     request: Request,
@@ -54,6 +62,9 @@ async def get_openid_configuration(
     tenant = await get_tenant(request)
 
     return {
+        "registration_endpoint": (
+            f"{tenant.primary_url}{Settings.base_path}/oauth/register"
+        ),
         "issuer": tenant.primary_url,
         "jwks_uri": f"{tenant.primary_url}/.well-known/jwks.json",
         "authorization_endpoint": (
@@ -71,6 +82,7 @@ async def get_openid_configuration(
         "token_endpoint_auth_methods_supported": [
             "client_secret_basic",
             "client_secret_post",
+            "none",
         ],
         "claims_supported": [
             "sub",

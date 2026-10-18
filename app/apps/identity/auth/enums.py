@@ -238,18 +238,17 @@ PASSWORD_WITH_TOTP = AuthFlow(
 
 PASSWORD_OR_OTP = AuthFlow(
     allowed_identifiers=[
+        AuthIdentifier.EMAIL,
         AuthIdentifier.USERNAME,
         AuthIdentifier.PHONE,
-        AuthIdentifier.TELEGRAM_ID,
     ],
     steps=[
         # Step 1: Password
         AuthStep(
             methods=[
                 AuthSecret.PASSWORD,
+                AuthSecret.EMAIL_OTP,
                 AuthSecret.PHONE_OTP,
-                AuthSecret.OAUTH,
-                AuthSecret.TELEGRAM_TOKEN,
             ],
             required_num=1,
         ),

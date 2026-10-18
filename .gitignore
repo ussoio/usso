@@ -171,3 +171,9 @@ scripts
 *.pem
 
 .DS_Store
+
+# graphify local code map
+graphify-out/
+# Private environment backups must never enter the shared core.
+.env.bak*
+.env.backup*

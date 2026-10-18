@@ -63,6 +63,17 @@ def get_signature(challenge: str, **kwargs: object) -> str:
     ).hexdigest()
 
 
+# Salt prefix that marks a challenge as requiring the image code. The salt is
+# part of the signed challenge, so a client cannot remove this marker.
+# ``secrets.token_urlsafe`` never emits ".", so the prefix is unambiguous.
+IMAGE_CODE_SALT_PREFIX = "img."
+
+
+def code_key(signature: str) -> str:
+    """Redis key of the image code bound to one challenge signature."""
+    return f"captcha:code:{signature}"
+
+
 class AltchaAlgorithm(StrEnum):
     """Supported hash algorithms for ALTCHA challenges."""
 
@@ -123,7 +134,8 @@ class ChallengeResponse(BaseModel):
         """
         iat = int(datetime.now(UTC).timestamp())
         exp = int(iat + Settings.captcha_verification_duration)
-        salt = f"{secrets.token_urlsafe(16)}_iat={iat}?expires={exp}"
+        prefix = IMAGE_CODE_SALT_PREFIX if image_captcha else ""
+        salt = f"{prefix}{secrets.token_urlsafe(16)}_iat={iat}?expires={exp}"
         max_number = Settings.captcha_max_number
         if image_captcha:
             secret_length = 4 + secrets.randbelow(3)
@@ -147,12 +159,15 @@ class ChallengeResponse(BaseModel):
         ).hexdigest()
 
         if secret_code:
-            key = f"captcha:code:{fingerprint}"
+            # Bind the code to this challenge, not to the client fingerprint:
+            # the fingerprint can differ between challenge and verify (proxy,
+            # IP change) and is shared by concurrent challenges.
+            key = code_key(signature)
             await redis.hset(
                 key,
                 mapping={
                     "code": secret_code,
-                    "signature": signature,
+                    "fingerprint": fingerprint,
                 },
             )
             await redis.expire(key, Settings.captcha_verification_duration)
@@ -371,35 +386,35 @@ class ValidationRequest(BaseModel):
         """
         Validate the captcha code against stored challenge.
 
-        Checks if the provided code matches the stored code for the fingerprint
-        and if the signature matches the challenge signature. Letter case is
-        ignored for image captcha codes.
+        Challenges without the signed image marker need no code. Challenges
+        with the marker fail closed: the stored code for this exact signature
+        must exist and match. A wrong code deletes the stored code, so the
+        client must request a new challenge. Letter case is ignored.
 
         Args:
             code: The captcha code to validate. If None, uses code from payload.
-            fingerprint: Client fingerprint for retrieving stored code.
+            fingerprint: Unused; kept for call-site compatibility.
 
         Returns:
             True if code is valid and matches, False otherwise.
 
         """
+        del fingerprint
+        if not self.challenge.salt.startswith(IMAGE_CODE_SALT_PREFIX):
+            return True
+
         submitted = code if code is not None else self.decoded_payload.get("code")
-        submitted_code = str(submitted).casefold() if submitted is not None else None
-        key = f"captcha:code:{fingerprint}"
+        if submitted is None or not str(submitted).strip():
+            return False
+
+        key = code_key(self.challenge.signature)
         token: bytes | None = await redis.hget(key, "code")
-        signature: bytes | None = await redis.hget(key, "signature")
+        if token is None:
+            return False
 
-        if token is None and signature is None:
-            return True
-
-        stored_signature = signature.decode() if signature is not None else None
-        # Fingerprint key is shared across challenges; a newer/older image
-        # challenge must not block PoW verify for a different signature.
-        if stored_signature != self.challenge.signature:
-            return True
-
-        stored_code = token.decode().casefold() if token is not None else None
-        if stored_code == submitted_code:
+        if hmac.compare_digest(
+            token.decode().casefold(), str(submitted).strip().casefold()
+        ):
             return True
 
         await redis.delete(key)

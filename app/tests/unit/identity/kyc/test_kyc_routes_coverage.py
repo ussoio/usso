@@ -22,8 +22,12 @@ def _kyc_data() -> KYCCreateSchema:
 
 
 def _tenant(*, access: object = None, temporary: object = None) -> SimpleNamespace:
+    def optional_user(_request: object, token_type: str | None = None) -> object:
+        return access if token_type == "access" else temporary
+
     return SimpleNamespace(
         uid="tenant-1",
+        optional_user=optional_user,
         get_auth=MagicMock(return_value=MagicMock(return_value=access)),
         temporary_auth=MagicMock(return_value=temporary),
         access_auth=MagicMock(return_value=access),

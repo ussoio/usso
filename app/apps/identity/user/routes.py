@@ -8,12 +8,14 @@ user identifiers, credentials, passkeys, and impersonation.
 from datetime import datetime
 
 from fastapi import APIRouter, Query, Request
+from fastapi_mongo_base.audit.context import audit_actor_scope
 from fastapi_mongo_base.schemas import PaginatedResponse
 from fastapi_mongo_base.utils import timezone
+from usso import UserData
 
 from server.config import Settings
 from server.exceptions import (
-    AlreadyExistsError,
+    AccountAlreadyExistsError,
     BadRequestError,
     ForbiddenError,
     NotFoundError,
@@ -235,11 +237,11 @@ class UserRouter(AbstractTenantUSSORouter):
         from apps.identity.auth.schemas import LoginRequest
 
         tenant = await self.get_tenant(request=request)
-        user = await self.get_user(request)
-        await self.authorize(action="create", user=user, filter_data=data.model_dump())
+        actor = await self.get_user(request)
+        await self.authorize(action="create", user=actor, filter_data=data.model_dump())
         await services.assert_assignable_tenant_roles(
             tenant_id=tenant.uid,
-            user_data=user,
+            user_data=actor,
             role_names=data.roles,
         )
 
@@ -248,54 +250,75 @@ class UserRouter(AbstractTenantUSSORouter):
             identifier=data.identifier,
         )
 
-        user = await services.find_user(
+        existing_user = await services.find_user(
             identifier=login_request,
             tenant_id=tenant.uid,
             tenant=tenant,
         )
-        if user:
-            raise BadRequestError(
-                error_code="user_already_exists",
-                detail="User already exists",
-                message={
-                    "en": "User already exists",
-                    "fa": "این کاربر قبلاً ثبت شده.",
-                },
-            )
+        if existing_user:
+            raise AccountAlreadyExistsError(detail="User already exists")
 
-        user = await services.create_user(login=login_request, tenant=tenant)
-        if not user:
-            raise BadRequestError(
-                error_code="registration_failed",
-                detail="Registration failed",
-                message={
-                    "en": "Registration failed. Check your details.",
-                    "fa": "ثبت‌نام انجام نشد. اطلاعات را بررسی کنید.",
-                },
+        with audit_actor_scope(actor):
+            user = await services.create_user(
+                login=login_request,
+                tenant=tenant,
+                record_audit=False,
             )
+            if not user:
+                raise BadRequestError(
+                    error_code="registration_failed",
+                    detail="Registration failed",
+                    message={
+                        "en": "Registration failed. Check your details.",
+                        "fa": "ثبت‌نام انجام نشد. اطلاعات را بررسی کنید.",
+                    },
+                )
 
-        user.roles = data.roles
-        user.name = data.name
-        # This route is restricted to user administrators. Accounts created
-        # explicitly by an administrator must not enter the registration
-        # approval flow as inactive users.
-        user.is_active = True
-        user.meta_data = data.meta_data
-        await user.save()
-        if data.national_id:
-            await models.UserIdentifier(
-                tenant_id=tenant.uid,
-                user_id=user.uid,
-                type=AuthIdentifier.NATIONAL_ID,
-                identifier=data.national_id,
-            ).save()
-        await services.upsert_admin_profile(
-            user=user,
-            first_name=data.first_name,
-            last_name=data.last_name,
-        )
-        await services.upsert_admin_kyc(user=user, birth_date=data.birth_date)
+            user.roles = data.roles
+            user.name = data.name
+            # This route is restricted to user administrators. Accounts created
+            # explicitly by an administrator must not enter the registration
+            # approval flow as inactive users.
+            user.is_active = True
+            user.meta_data = data.meta_data
+            await user.save()
+            if services.is_trusted_messenger_link(
+                identifier_type=data.identifier_type, caller=actor
+            ):
+                # create_user always sets current_identifier to the primary one.
+                user.current_identifier.verified_at = datetime.now(timezone.tz)
+                await user.current_identifier.save()
+            if data.national_id:
+                await models.UserIdentifier(
+                    tenant_id=tenant.uid,
+                    user_id=user.uid,
+                    type=AuthIdentifier.NATIONAL_ID,
+                    identifier=data.national_id,
+                ).save()
+            await services.upsert_admin_profile(
+                user=user,
+                first_name=data.first_name,
+                last_name=data.last_name,
+            )
+            await services.upsert_admin_kyc(user=user, birth_date=data.birth_date)
+            await services.record_user_created(user)
         return await user.to_detailed_schema()
+
+    async def _authorize_user_change(
+        self,
+        *,
+        action: str,
+        user: UserData | None,
+        target: models.User,
+        new_scopes: list[str] | None = None,
+    ) -> None:
+        """Usual scope check plus: never change a user with higher access."""
+        if user is None:
+            raise ForbiddenError(detail="An authenticated actor is required")
+        await self.authorize(action=action, user=user, filter_data=target.model_dump())
+        await services.assert_manageable_user(
+            actor=user, target=target, new_scopes=new_scopes
+        )
 
     async def update_item(
         self, request: Request, uid: str, data: schemas.UserUpdateSchema
@@ -324,10 +347,11 @@ class UserRouter(AbstractTenantUSSORouter):
         item: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
+        await self._authorize_user_change(
             action="update",
             user=user,
-            filter_data=item.model_dump(),
+            target=item,
+            new_scopes=data_dict.get("scopes"),
         )
         if "roles" in data_dict:
             await services.assert_assignable_tenant_roles(
@@ -336,7 +360,8 @@ class UserRouter(AbstractTenantUSSORouter):
                 role_names=data_dict.get("roles") or [],
             )
 
-        item = await self.model.update_item(item, data_dict)
+        with audit_actor_scope(user):
+            item = await self.model.update_item(item, data_dict)
         if profile_update:
             await services.upsert_admin_profile(user=item, **profile_update)
         if birth_date_provided:
@@ -350,16 +375,22 @@ class UserRouter(AbstractTenantUSSORouter):
         item: models.User,
         data_dict: dict[str, object],
     ) -> None:
-        """Refresh sessions when role/scope/membership fields change."""
+        """
+        Refresh sessions when role/scope/membership fields change.
+
+        Deactivation revokes every live session at once (forced sign-out).
+        """
+        if data_dict.get("is_active") is False:
+            await models.AuthSession.find({
+                "user_id": item.uid,
+                "is_deleted": False,
+            }).update_many({"$set": {"is_deleted": True}})
+            return
         permission_fields = ["roles", "scopes", "workspace_roles", "is_active"]
         if not any(field in data_dict for field in permission_fields):
             return
         workspaces_to_update: list[str | None] = []
-        if (
-            "roles" in data_dict
-            or "scopes" in data_dict
-            or "is_active" in data_dict
-        ):
+        if "roles" in data_dict or "scopes" in data_dict or "is_active" in data_dict:
             workspaces_to_update.append(None)
             workspaces_to_update.extend(item.workspace_ids or [])
         if "workspace_roles" in data_dict and data_dict.get("workspace_roles"):
@@ -401,12 +432,9 @@ class UserRouter(AbstractTenantUSSORouter):
         item: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="delete",
-            user=user,
-            filter_data=item.model_dump(),
-        )
-        item = await self.model.hard_delete(item)
+        await self._authorize_user_change(action="delete", user=user, target=item)
+        with audit_actor_scope(user):
+            item = await self.model.hard_delete(item)
         return await item.to_detailed_schema()
 
     async def impersonate_user(
@@ -507,8 +535,8 @@ class UserRouter(AbstractTenantUSSORouter):
                 message={"en": "User not found.", "fa": "کاربر پیدا نشد."},
             )
 
-        await self.authorize(
-            action="admin", user=user, filter_data=impersonated_user.model_dump()
+        await self._authorize_user_change(
+            action="admin", user=user, target=impersonated_user
         )
         tenant = await self.get_tenant(request=request)
         return user, impersonated_user, tenant
@@ -599,8 +627,12 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
+        )
+
+        trusted_messenger_link = services.is_trusted_messenger_link(
+            identifier_type=data.type, caller=user
         )
 
         # Check if identifier already exists
@@ -608,15 +640,22 @@ class UserRouter(AbstractTenantUSSORouter):
             "tenant_id": target_user.tenant_id,
             "type": data.type,
             "identifier": data.identifier,
+            "is_deleted": False,
         })
         if existing:
-            raise AlreadyExistsError(
-                detail="Identifier already exists",
-                message={
-                    "en": "Identifier already exists",
-                    "fa": "این راه تماس قبلاً ثبت شده.",
-                },
-            )
+            # Re-linking by the trusted bot heals ids linked before trusted
+            # links were verified and refreshes the messenger username.
+            if trusted_messenger_link and existing.user_id == target_user.uid:
+                meta_data = services.apply_messenger_profile(
+                    current=existing.meta_data, incoming=data.meta_data
+                )
+                if existing.verified_at is None or meta_data != existing.meta_data:
+                    existing.verified_at = existing.verified_at or datetime.now(
+                        timezone.tz
+                    )
+                    existing.meta_data = meta_data
+                    await existing.save()
+            raise AccountAlreadyExistsError(detail="Identifier already exists")
 
         # Create new identifier
         identifier = models.UserIdentifier(
@@ -625,6 +664,12 @@ class UserRouter(AbstractTenantUSSORouter):
             type=data.type,
             identifier=data.identifier,
             is_primary=data.is_primary,
+            verified_at=datetime.now(timezone.tz) if trusted_messenger_link else None,
+            meta_data=(
+                services.apply_messenger_profile(current=None, incoming=data.meta_data)
+                if trusted_messenger_link
+                else None
+            ),
         )
         await identifier.save()
 
@@ -680,8 +725,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         identifier = await models.UserIdentifier.get_by_uid(identifier_id)
@@ -706,13 +751,7 @@ class UserRouter(AbstractTenantUSSORouter):
                 "is_deleted": False,
             })
             if existing:
-                raise AlreadyExistsError(
-                    detail="Identifier already exists",
-                    message={
-                        "en": "Identifier already exists",
-                        "fa": "این شناسه قبلاً ثبت شده.",
-                    },
-                )
+                raise AccountAlreadyExistsError(detail="Identifier already exists")
             update_data["identifier"] = validated.identifier
         for field, value in update_data.items():
             setattr(identifier, field, value)
@@ -728,8 +767,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         identifier = await models.UserIdentifier.get_by_uid(identifier_id)
@@ -766,8 +805,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         identifier = await models.UserIdentifier.get_by_uid(identifier_id)
@@ -823,8 +862,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         identifier = await models.UserIdentifier.get_by_uid(identifier_id)
@@ -919,8 +958,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         # Hash password if needed
@@ -958,8 +997,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         credential = await models.Credential.get_by_uid(credential_id)
@@ -1001,8 +1040,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         credential = await models.Credential.get_by_uid(credential_id)
@@ -1025,8 +1064,8 @@ class UserRouter(AbstractTenantUSSORouter):
         target_user: models.User = await self.get_item(
             uid=uid, user_id=None, tenant_id=user.tenant_id
         )
-        await self.authorize(
-            action="update", user=user, filter_data=target_user.model_dump()
+        await self._authorize_user_change(
+            action="update", user=user, target=target_user
         )
 
         credential = await models.Credential.get_by_uid(credential_id)

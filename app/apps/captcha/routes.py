@@ -48,7 +48,10 @@ async def get_challenge(request: Request, response: Response) -> dict[str, objec
     has_trusted_payload = False
     if altcha_payload:
         try:
-            await _validate_altcha_payload(altcha_payload, fingerprint=fingerprint)
+            # Only check the solved captcha here; do not spend one of its uses.
+            await _validate_altcha_payload(
+                altcha_payload, fingerprint=fingerprint, count_usage=False
+            )
             has_trusted_payload = True
         except BadRequestError:
             pass
@@ -62,8 +65,9 @@ async def get_challenge(request: Request, response: Response) -> dict[str, objec
         if attempts == 1:
             await redis.expire(key, 3600)
 
-        # Show image captcha if attempts >= threshold
-        show_image_captcha = attempts >= tenant.config.image_captcha_tries
+        # The first ``image_captcha_tries`` challenges are PoW only; later
+        # ones in the same hour also need the image code.
+        show_image_captcha = attempts > tenant.config.image_captcha_tries
 
         host = request.headers.get("host", "")
         parts = host.split(".")
@@ -108,7 +112,7 @@ async def verify(
     """
     return {
         "verified": True,
-        "payload": True,
+        "payload": payload,
         "message": "captcha verified successfully",
         # "altcha_payload": payload,  # ruff:ignore[commented-out-code]
     }

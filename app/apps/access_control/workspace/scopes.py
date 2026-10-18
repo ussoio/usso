@@ -4,6 +4,8 @@ _default_workspace_scopes: dict[str, list[str]] = {
     "workspace_ceo_scopes": [
         "read:sso/*/*?workspace_id={workspace_id}",
         "manage:sso/usso/workspace?workspace_id={workspace_id}",
+        # Workspace manager: add/remove members of this workspace only.
+        "manage:sso/usso/member?workspace_id={workspace_id}",
         "create:sso/legal-acceptance?workspace_id={workspace_id}",
         "read:finance/*/*?workspace_id={workspace_id}",
         "create:finance/ipg/*?workspace_id={workspace_id}",

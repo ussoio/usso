@@ -252,3 +252,67 @@ async def test_scope_ceiling_missing_target_and_caller_fallback() -> None:
         user_id=None,
         workspace_id="workspace",
     ) == ["read:x"]
+
+
+def _target_user(uid: str, scopes: list[str]) -> SimpleNamespace:
+    return SimpleNamespace(
+        uid=uid,
+        tenant_id="tenant",
+        get_effective_scopes_for_api=mock.AsyncMock(return_value=scopes),
+    )
+
+
+@pytest.mark.asyncio
+async def test_scope_ceiling_adds_self_service_scopes_for_own_key() -> None:
+    """Users with no role scopes can grant tenant self-service scopes to own keys."""
+    caller_user = _target_user("u1", [])
+    with mock.patch(
+        "apps.identity.service_account.User.get_item",
+        new=mock.AsyncMock(return_value=caller_user),
+    ):
+        ceiling = await sa.resolve_scope_ceiling(
+            caller_user=caller_user,
+            user_id="u1",
+            workspace_id=None,
+            self_service_scopes=["create:ai/ai-toolkit/*", "read:ai/ai-toolkit/*"],
+        )
+    assert ceiling == ["create:ai/ai-toolkit/*", "read:ai/ai-toolkit/*"]
+    sa.assert_scopes_subset(requested=["create:ai/ai-toolkit/*"], ceiling=ceiling)
+    with pytest.raises(ForbiddenError):
+        sa.assert_scopes_subset(requested=["admin:ai/*"], ceiling=ceiling)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("user_id", "workspace_id"), [("other", None), ("u1", "ws-1")])
+async def test_scope_ceiling_self_service_only_for_own_user_key(
+    user_id: str, workspace_id: str | None
+) -> None:
+    """Self-service scopes never widen keys for other users or workspaces."""
+    caller_user = _target_user("u1", [])
+    with mock.patch(
+        "apps.identity.service_account.User.get_item",
+        new=mock.AsyncMock(return_value=_target_user(user_id, ["read:x"])),
+    ):
+        ceiling = await sa.resolve_scope_ceiling(
+            caller_user=caller_user,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            self_service_scopes=["create:ai/ai-toolkit/*"],
+        )
+    assert ceiling == ["read:x"]
+
+
+@pytest.mark.asyncio
+async def test_scope_ceiling_merges_role_and_self_service_without_duplicates() -> None:
+    caller_user = _target_user("u1", ["manage:ai/*", "create:ai/ai-toolkit/*"])
+    with mock.patch(
+        "apps.identity.service_account.User.get_item",
+        new=mock.AsyncMock(return_value=caller_user),
+    ):
+        ceiling = await sa.resolve_scope_ceiling(
+            caller_user=caller_user,
+            user_id="u1",
+            workspace_id=None,
+            self_service_scopes=["create:ai/ai-toolkit/*", "read:ai/ai-toolkit/*"],
+        )
+    assert ceiling == ["manage:ai/*", "create:ai/ai-toolkit/*", "read:ai/ai-toolkit/*"]

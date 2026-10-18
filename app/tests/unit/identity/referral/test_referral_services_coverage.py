@@ -78,8 +78,12 @@ async def test_post_webhook_logs_failures_and_defaults_headers() -> None:
     client.post.assert_awaited_once_with(
         "https://hooks.test/fail", json={"value": 1}, headers={}
     )
+    # A non-network error is not transient: one attempt, no retry.
     log.assert_called_once_with(
-        "Referral webhook failed for %s", "https://hooks.test/fail"
+        "Webhook failed for %s (attempt %d/%d)",
+        "https://hooks.test/fail",
+        1,
+        services.WEBHOOK_ATTEMPTS,
     )
 
 
@@ -136,7 +140,7 @@ def test_dispatch_tenant_webhooks_handles_empty_hook_list() -> None:
     create_task.assert_not_called()
 
 
-def test_on_referral_registration_dispatches_both_events() -> None:
+def test_on_referral_registration_dispatches_all_events() -> None:
     tenant = SimpleNamespace(uid="tenant-1")
     referral = SimpleNamespace(code="R1", user_id="referrer-1", usage_count=3)
     invitee = SimpleNamespace(uid="invitee-1")
@@ -147,6 +151,16 @@ def test_on_referral_registration_dispatches_both_events() -> None:
         )
 
     assert dispatch.call_args_list == [
+        call(
+            tenant=tenant,
+            event=services.REFERRAL_REGISTERED_EVENT,
+            payload={
+                "tenant_id": "tenant-1",
+                "referrer_user_id": "referrer-1",
+                "invitee_user_id": "invitee-1",
+                "referral_code": "R1",
+            },
+        ),
         call(
             tenant=tenant,
             event=services.REFERRAL_USED_EVENT,
@@ -169,3 +183,39 @@ def test_on_referral_registration_dispatches_both_events() -> None:
             },
         ),
     ]
+
+
+def test_referral_registered_webhook_body_has_contract_fields() -> None:
+    tenant = SimpleNamespace(
+        uid="tenant-1",
+        config=SimpleNamespace(
+            integration=SimpleNamespace(
+                webhooks=[
+                    SimpleNamespace(
+                        url="https://hooks.test/a",
+                        headers=None,
+                        events=["referral_registered"],
+                    )
+                ]
+            )
+        ),
+    )
+    referral = SimpleNamespace(code="R1", user_id="referrer-1", usage_count=1)
+    invitee = SimpleNamespace(uid="invitee-1")
+
+    with (
+        patch.object(services, "_post_webhook", new=MagicMock()) as post,
+        patch.object(services.asyncio, "create_task") as create_task,
+    ):
+        services.on_referral_registration(
+            tenant=tenant, referral=referral, invitee=invitee
+        )
+
+    assert create_task.call_count == 1
+    assert post.call_args.kwargs["payload"] == {
+        "event": "referral_registered",
+        "tenant_id": "tenant-1",
+        "referrer_user_id": "referrer-1",
+        "invitee_user_id": "invitee-1",
+        "referral_code": "R1",
+    }

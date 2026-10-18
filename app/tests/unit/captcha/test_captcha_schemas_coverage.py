@@ -36,6 +36,21 @@ def _challenge_payload(
     }
 
 
+def _image_challenge_payload(number: int = 7) -> dict:
+    iat = int(datetime.now(UTC).timestamp())
+    exp = iat + schemas.Settings.captcha_verification_duration
+    salt = f"{schemas.IMAGE_CODE_SALT_PREFIX}salt_iat={iat}?expires={exp}"
+    challenge = schemas.get_hashed_phrase(
+        salt, number, schemas.Settings.captcha_max_number, iat, exp
+    )
+    return {
+        **_challenge_payload(number=number, iat=iat, exp=exp),
+        "challenge": challenge,
+        "salt": salt,
+        "signature": schemas.get_signature(challenge),
+    }
+
+
 def _request(payload: dict | None = None) -> schemas.ValidationRequest:
     raw = json.dumps(payload or _challenge_payload()).encode()
     encoded = base64.b64encode(raw).decode().rstrip("=")
@@ -87,9 +102,12 @@ async def test_random_image_challenge_stores_casefolded_code() -> None:
         )
     assert challenge.codeChallenge.length == 4
     assert challenge.codeChallenge.image.startswith("data:image/png;base64,")
+    assert challenge.salt.startswith(schemas.IMAGE_CODE_SALT_PREFIX)
+    assert challenge.check_signature() is True
     assert redis.hset.await_args.kwargs["mapping"]["code"] == "abc9"
     redis.expire.assert_awaited_once_with(
-        "captcha:code:fp", schemas.Settings.captcha_verification_duration
+        schemas.code_key(challenge.signature),
+        schemas.Settings.captcha_verification_duration,
     )
 
 
@@ -183,28 +201,60 @@ async def test_validate_usage_bypass_allowed_and_exceeded() -> None:
 
 @pytest.mark.asyncio
 async def test_validate_code_missing_match_and_mismatch() -> None:
-    request = _request({**_challenge_payload(), "code": "AbC9"})
-    redis = SimpleNamespace(
-        hget=AsyncMock(side_effect=[None, None]), delete=AsyncMock()
-    )
+    # Plain PoW challenge (no signed image marker) needs no code.
+    plain = _request()
+    redis = SimpleNamespace(hget=AsyncMock(), delete=AsyncMock())
     with patch.object(schemas, "redis", redis):
+        assert await plain.validate_code(None, "fp") is True
+    redis.hget.assert_not_awaited()
+
+    request = _request({**_image_challenge_payload(), "code": "AbC9"})
+    key = schemas.code_key(request.challenge.signature)
+
+    redis.hget = AsyncMock(return_value=b"abc9")
+    with patch.object(schemas, "redis", redis):
+        assert await request.validate_code("ABC9", "fp") is True
         assert await request.validate_code(None, "fp") is True
+    redis.hget.assert_awaited_with(key, "code")
 
-    redis.hget.side_effect = [b"abc9", request.challenge.signature.encode()]
-    with patch.object(schemas, "redis", redis):
-        assert await request.validate_code("ABC9", "fp") is True
-
-    # Stale code for another challenge signature must not block this verify.
-    redis.hget.side_effect = [b"wrong", b"wrong-signature"]
-    with patch.object(schemas, "redis", redis):
-        assert await request.validate_code("ABC9", "fp") is True
-    redis.delete.assert_not_awaited()
-
-    # Matching signature with wrong code still fails and clears the key.
-    redis.hget.side_effect = [b"wrong", request.challenge.signature.encode()]
+    # Image challenge whose stored code is gone (expired/consumed) fails closed.
+    redis.hget = AsyncMock(return_value=None)
     with patch.object(schemas, "redis", redis):
         assert await request.validate_code("ABC9", "fp") is False
-    redis.delete.assert_awaited_once_with("captcha:code:fp")
+
+    # Wrong code fails and clears the stored code.
+    redis.hget = AsyncMock(return_value=b"wrong")
+    with patch.object(schemas, "redis", redis):
+        assert await request.validate_code("ABC9", "fp") is False
+    redis.delete.assert_awaited_once_with(key)
+
+
+@pytest.mark.asyncio
+async def test_image_challenge_without_code_is_rejected() -> None:
+    """Regression: an image challenge must not verify with no/empty code."""
+    request = _request(_image_challenge_payload())
+    redis = SimpleNamespace(hget=AsyncMock(return_value=b"abc9"), delete=AsyncMock())
+    with patch.object(schemas, "redis", redis):
+        assert await request.validate_code(None, "fp") is False
+        assert await request.validate_code("   ", "fp") is False
+
+
+@pytest.mark.asyncio
+async def test_image_code_does_not_depend_on_fingerprint() -> None:
+    """Regression: a different verify fingerprint must not skip the code check."""
+    request = _request(_image_challenge_payload())
+    redis = SimpleNamespace(hget=AsyncMock(return_value=b"abc9"), delete=AsyncMock())
+    with patch.object(schemas, "redis", redis):
+        assert await request.validate_code("zzzz", "other-fp") is False
+    redis.delete.assert_awaited_once()
+
+
+def test_image_marker_cannot_be_stripped_without_breaking_signature() -> None:
+    payload = _image_challenge_payload()
+    payload["salt"] = payload["salt"].removeprefix(schemas.IMAGE_CODE_SALT_PREFIX)
+    challenge = schemas.ChallengeResponse(**payload)
+    # The marker is hashed into ``challenge``; removing it breaks the PoW check.
+    assert challenge.check_secret(payload["number"]) is False
 
 
 @pytest.mark.asyncio

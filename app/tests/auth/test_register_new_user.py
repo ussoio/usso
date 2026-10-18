@@ -91,7 +91,9 @@ async def test_register_new_user_calls_create_user(
         await register_new_user(login_request=login_request, tenant=mock_tenant)
 
         # Verify create_user was called with correct parameters
-        mock_create.assert_called_once_with(login=login_request, tenant=mock_tenant)
+        mock_create.assert_called_once_with(
+            login=login_request, tenant=mock_tenant, audit_as_self=True
+        )
 
 
 @pytest.mark.asyncio

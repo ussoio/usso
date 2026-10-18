@@ -10,7 +10,11 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, HttpUrl
 from usso.config import HeaderConfig
 
-from apps.identity.auth.enums import PASSWORD_OR_OTP, AuthFlow
+from apps.identity.auth.enums import (
+    PASSWORD_OR_OTP,
+    AuthFlow,
+    AuthIdentifier,
+)
 
 from .branding import BrandingModel
 from .messaging.enums import TemplateType
@@ -27,6 +31,14 @@ class AuthenticationConfig(BaseModel):
     login_flow: AuthFlow = Field(
         default=PASSWORD_OR_OTP,
         description="The login flow configuration for this tenant",
+    )
+    identifier_patterns: dict[AuthIdentifier, str] = Field(
+        default_factory=lambda: {
+            AuthIdentifier.EMAIL: r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$",
+            AuthIdentifier.PHONE: r"^(?:\+98|0098|98)?9\d{9}$|^09\d{9}$",
+            AuthIdentifier.USERNAME: r"^[a-zA-Z0-9_]{3,}$",
+        },
+        description="Regular expressions used by clients to detect identifier types",
     )
 
     # MFA Configuration
@@ -199,6 +211,14 @@ class APIKeyConfig(BaseModel):
     )
     prefix: str = Field(default="uss_", description="Prefix for generated API keys")
     length: int = Field(default=32, description="Length of generated API keys")
+    self_service_scopes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Scopes any user may grant to an API key bound to themselves, on top "
+            "of their role scopes (e.g. create:ai/ai-toolkit/*). Keep these "
+            "below admin; on-behalf and management scopes stay role-only."
+        ),
+    )
 
 
 class ServiceAccountConfig(BaseModel):
@@ -237,10 +257,17 @@ class WebhookConfig(BaseModel):
         description="Optional HTTP headers to include in webhook requests",
     )
     events: list[str] = Field(
-        default=["user.created", "user.updated", "user.deleted", "referral.used"],
+        default=[
+            "user.created",
+            "user.updated",
+            "user.deleted",
+            "referral.used",
+            "referral_registered",
+            "user.activated",
+        ],
         description=(
             "Events that trigger this webhook "
-            "(e.g. user.created, referral.used for invite rewards)"
+            "(e.g. user.created, referral_registered for invite rewards)"
         ),
     )
 

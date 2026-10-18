@@ -1,7 +1,10 @@
 """KYC routes."""
 
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
+from fastapi_mongo_base.utils import timezone
 from usso import UserData, authorization
 from usso.exceptions import PermissionDenied
 
@@ -34,8 +37,8 @@ async def create_kyc(
 ) -> KYCSchema:
     """Create a new KYC."""
     tenant = await get_request_tenant(request)
-    access_payload = tenant.get_auth("access", raise_exception=False)(request)
-    temporary_payload = tenant.temporary_auth(request)
+    access_payload = tenant.optional_user(request, "access")
+    temporary_payload = tenant.optional_user(request)
     user_payload = temporary_payload or access_payload
     if user_payload is None:
         raise UnauthorizedError(error_code="unauthorized")
@@ -64,6 +67,7 @@ async def create_kyc(
         kyc_data.national_code, kyc_data.birth_date_shamsi
     )
 
+    verified_at = datetime.now(timezone.tz)
     current_user = await User.get_item(
         uid=user_payload.user_id, tenant_id=user_payload.tenant_id
     )
@@ -80,6 +84,8 @@ async def create_kyc(
         birth_date=kyc_data.birth_date,
         status=KYCStatus.APPROVED,
         civil_data=civil_data,
+        civil_verified_at=verified_at,
+        phone_verified_at=verified_at,
     ).save()
 
     await activate_user(kyc, user)
@@ -127,7 +133,7 @@ async def get_user_kyc(request: Request, user_id: str) -> KYCSchema | None:
 async def callback_kyc(request: Request, uid: str) -> KYCSchema:
     """Verify KYC request on callback."""
     tenant = await get_request_tenant(request)
-    temporary_payload = tenant.temporary_auth(request)
+    temporary_payload = tenant.optional_user(request)
     kyc = await KYC.get_item(
         uid=uid,
         tenant_id=temporary_payload.tenant_id,

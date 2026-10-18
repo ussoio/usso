@@ -43,6 +43,7 @@ def _tenant(**overrides: object) -> SimpleNamespace:
         ),
         "secrets": SimpleNamespace(oauth_secrets={"github": object()}),
         "temporary_auth": MagicMock(return_value="temporary-payload"),
+        "optional_user": MagicMock(return_value="temporary-payload"),
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -349,7 +350,7 @@ async def test_magic_link_completes_login_flow() -> None:
 async def test_generate_passkey_for_temporary_user() -> None:
     request = _request(url="https://login.example.test/auth/passkey")
     tenant = _tenant(
-        temporary_auth=MagicMock(return_value=SimpleNamespace(user_id="user-1"))
+        optional_user=MagicMock(return_value=SimpleNamespace(user_id="user-1"))
     )
     generate = AsyncMock(return_value={"challenge": "abc"})
     with (
@@ -943,7 +944,7 @@ async def test_login_by_telegram_completes_flow(display_name: str | None) -> Non
     oauth_secret = SimpleNamespace(
         client_id="telegram-client", discovery_url="https://telegram/.well-known"
     )
-    tenant = _tenant(temporary_auth=MagicMock(return_value="temporary-payload"))
+    tenant = _tenant(optional_user=MagicMock(return_value="temporary-payload"))
     login_request = _secure_login_request()
     flow = _flow()
     payloads = {TokenType.ACCESS: object()}

@@ -2,7 +2,7 @@
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi_mongo_base.utils import timezone
@@ -228,3 +228,41 @@ def test_device_authorization_expiry_handles_naive_and_aware_datetimes(
         expires_at=expires_at
     )
     assert authorization.is_expired() is True
+
+
+@pytest.mark.asyncio
+async def test_user_consent_covers_requires_all_scopes() -> None:
+    stored = SimpleNamespace(scopes=["openid", "profile"])
+    with patch.object(
+        models.UserConsent, "find_one", new=AsyncMock(return_value=stored)
+    ) as find:
+        assert await models.UserConsent.covers("t", "u", "c", ["openid"])
+        assert not await models.UserConsent.covers("t", "u", "c", ["openid", "write"])
+    assert find.await_args.args[0] == {
+        "tenant_id": "t",
+        "user_id": "u",
+        "client_id": "c",
+    }
+    with patch.object(models.UserConsent, "find_one", new=AsyncMock(return_value=None)):
+        assert not await models.UserConsent.covers("t", "u", "c", ["openid"])
+
+
+@pytest.mark.asyncio
+async def test_user_consent_grant_creates_then_widens() -> None:
+    # Document construction needs an initialised Beanie; stand in for the class.
+    fake_cls = MagicMock()
+    fake_cls.find_one = AsyncMock(return_value=None)
+    fake_cls.return_value.save = AsyncMock()
+    created = await models.UserConsent.grant.__func__(
+        fake_cls, "t", "u", "c", ["profile", "openid"]
+    )
+    assert fake_cls.call_args.kwargs["scopes"] == ["openid", "profile"]
+    created.save.assert_awaited_once()
+
+    existing = SimpleNamespace(scopes=["openid"], save=AsyncMock())
+    with patch.object(
+        models.UserConsent, "find_one", new=AsyncMock(return_value=existing)
+    ):
+        await models.UserConsent.grant("t", "u", "c", ["write"])
+    assert existing.scopes == ["openid", "write"]
+    existing.save.assert_awaited_once()

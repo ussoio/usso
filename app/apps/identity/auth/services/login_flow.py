@@ -14,6 +14,7 @@ from server.exceptions import (
 
 from ....tenant.models import Tenant
 from ...referral.models import ReferralCode
+from ...referral.services import dispatch_tenant_webhooks
 from ...user.models import User
 from ...user.services import (
     authenticate_user,
@@ -136,6 +137,7 @@ async def _create_user_with_referral_reservation(
         user = await create_user(
             login=login_request,
             tenant=tenant,
+            audit_as_self=True,
             **create_kwargs,
         )
     except Exception:
@@ -298,6 +300,26 @@ async def verify_identifier(*, user: User, login_request: LoginRequest) -> bool:
     return True
 
 
+USER_ACTIVATED_EVENT = "user.activated"
+
+
+async def _mark_active(*, user: User, tenant: Tenant) -> None:
+    """
+    Activate a user and tell tenant webhooks, once, that the account is real.
+
+    Fired on activation (a verified account), not on creation: an OTP request
+    creates a pending user for any phone number, so a creation event would let
+    anyone trigger rewards for numbers they do not own.
+    """
+    user.is_active = True
+    await user.save()
+    dispatch_tenant_webhooks(
+        tenant=tenant,
+        event=USER_ACTIVATED_EVENT,
+        payload={"tenant_id": tenant.uid, "user_id": user.uid},
+    )
+
+
 async def activate_user_if_eligible(
     *, user: User, tenant: Tenant, login_request: LoginRequest
 ) -> bool:
@@ -336,8 +358,7 @@ async def activate_user_if_eligible(
         case "none":
             # No approval required - activate immediately
             if login_request.method:
-                user.is_active = True
-                await user.save()
+                await _mark_active(user=user, tenant=tenant)
                 return True
 
         case "identifier":
@@ -347,8 +368,7 @@ async def activate_user_if_eligible(
             if not identifier_verified:
                 return False
 
-            user.is_active = True
-            await user.save()
+            await _mark_active(user=user, tenant=tenant)
             return True
 
         case "manual_review":
@@ -363,8 +383,7 @@ async def activate_user_if_eligible(
             kyc = await KYC.get_by_user_id(user_id=user.uid, tenant_id=tenant.uid)
             if not kyc:
                 return False
-            user.is_active = True
-            await user.save()
+            await _mark_active(user=user, tenant=tenant)
             return True
 
         case _:
@@ -466,6 +485,45 @@ _LOGIN_FLOW_FAILURES: dict[str, tuple[type[BaseHTTPException], dict[str, str]]] 
     ),
 }
 
+# Methods that cannot be delivered to a given identifier type (an email
+# address cannot receive an SMS code, a phone cannot receive a magic link).
+# Everything else in the step (password, passkey, ...) is kept.
+_IDENTIFIER_INCOMPATIBLE_METHODS: dict[AuthIdentifier, frozenset[AuthSecret]] = {
+    AuthIdentifier.EMAIL: frozenset({AuthSecret.PHONE_OTP}),
+    AuthIdentifier.PHONE: frozenset({AuthSecret.EMAIL_OTP, AuthSecret.MAGIC_LINK}),
+    AuthIdentifier.USERNAME: frozenset({
+        AuthSecret.EMAIL_OTP,
+        AuthSecret.PHONE_OTP,
+        AuthSecret.MAGIC_LINK,
+    }),
+}
+
+
+def _step_for_identifier(
+    *, step: AuthStep, identifier_type: AuthIdentifier | None
+) -> AuthStep:
+    excluded = _IDENTIFIER_INCOMPATIBLE_METHODS.get(identifier_type)
+    if not excluded:
+        return step
+
+    methods = [method for method in step.methods if method not in excluded]
+    if not methods:
+        return step
+    return step.model_copy(
+        update={
+            "methods": methods,
+            "required_num": min(step.required_num, len(methods)),
+        }
+    )
+
+
+def _optional_step_for_identifier(
+    *, step: AuthStep | None, identifier_type: AuthIdentifier | None
+) -> AuthStep | None:
+    if step is None:
+        return None
+    return _step_for_identifier(step=step, identifier_type=identifier_type)
+
 
 def _raise_login_flow_failed(*, error_code: str, detail: str) -> None:
     exc_cls, message = _LOGIN_FLOW_FAILURES.get(
@@ -525,6 +583,7 @@ async def resolve_login_attempt(
             },
         )
 
+    next_step = _step_for_identifier(step=next_step, identifier_type=identifier.type)
     otp_delivery = _determine_otp_delivery(next_step)
 
     return LoginAttemptResult(
@@ -620,7 +679,10 @@ async def process_login_flow(
     amr = list({*amr, login_request.method.value}) if login_request.method else amr
 
     # Check main login flow completion
-    next_step = validate_flow_completion(login_flow=login_flow, amr=amr)
+    next_step = _optional_step_for_identifier(
+        step=validate_flow_completion(login_flow=login_flow, amr=amr),
+        identifier_type=login_request.type,
+    )
     if next_step:
         return LoginFlowResult(
             status=LoginStatus.MFA_REQUIRED,

@@ -7,6 +7,7 @@ authorization server functionality.
 
 import base64
 import hashlib
+import inspect
 import secrets
 import time
 import uuid
@@ -16,15 +17,18 @@ from fastapi_mongo_base.utils import timezone
 
 from apps.identity.user.models import User
 from apps.tenant.models import Tenant
+from server.config import Settings
 from server.exceptions import BadRequestError, UnauthorizedError
 from utils.hasher import PasswordHasherService
 
 from .client_management import get_oauth_client
 from .models import AuthorizationCode, OAuthClient, OAuthSession, OAuthToken
 from .schemas import (
+    PUBLIC_CLIENT_SCOPES,
     AuthorizationRequestSchema,
     ClientRegistrationRequestSchema,
     ClientRegistrationResponseSchema,
+    PublicClientRegistrationSchema,
     Scope,
     TokenIntrospectionResponseSchema,
     TokenResponseSchema,
@@ -206,7 +210,7 @@ def _validate_pkce(auth_code: AuthorizationCode, code_verifier: str | None) -> N
 
 def verify_oauth_client_secret(client: OAuthClient, client_secret: str | None) -> bool:
     """Verify a confidential OAuth client's secret in constant time."""
-    if client.client_type != "confidential":
+    if client.client_type == "public":
         return True
     if not client_secret:
         return False
@@ -503,6 +507,22 @@ async def exchange_service_account_client_credentials(
     )
 
 
+def access_token_audience(client: OAuthClient) -> str | list[str]:
+    """
+    ``aud`` for a client's access token.
+
+    Openly registered clients (MCP agents) are additionally bound to the
+    configured resource servers so each resource can verify the token was meant
+    for it. Every other client keeps ``aud == client_id``.
+    """
+    if (
+        getattr(client, "user_id", None) == DYNAMIC_REGISTRATION_USER_ID
+        and Settings.dynamic_client_audiences
+    ):
+        return [client.client_id, *Settings.dynamic_client_audiences]
+    return client.client_id
+
+
 async def create_tokens(
     client: OAuthClient,
     user: User,
@@ -525,12 +545,54 @@ async def create_tokens(
     # Create access token
     access_expires_in = tenant.config.token.access_timeout
     refresh_expires_in = tenant.config.token.refresh_timeout
+
+    now = int(time.time())
+    workspace_id = None
+    if (
+        getattr(getattr(tenant, "config", None), "workspace", None)
+        and tenant.config.workspace.enabled
+    ):
+        try:
+            from apps.access_control.workspace.services import ensure_personal_workspace
+
+            personal = await ensure_personal_workspace(user=user, tenant=tenant)
+            if personal and personal.is_active:
+                workspace_id = user.uid
+        except Exception:
+            workspace_id = user.uid
+
+    from apps.identity.user.jwt_claims import jwt_claims_for_user
+
+    jwt_payload = {
+        "jti": str(uuid.uuid4()),
+        "token_type": "access",
+        "iss": tenant.primary_url,
+        "aud": access_token_audience(client),
+        "iat": now,
+        "nbf": now,
+        "exp": now + access_expires_in,
+        "sub": user.uid,
+        "user_id": user.uid,
+        "tenant_id": tenant.uid,
+        "workspace_id": workspace_id,
+        "scopes": scope,
+        "client_id": client.client_id,
+        "amr": ["oauth2"],
+        **jwt_claims_for_user(user),
+    }
+    raw_jwt = tenant.sign_jwt(jwt_payload)
+    if inspect.isawaitable(raw_jwt):
+        raw_jwt = await raw_jwt
+    if not isinstance(raw_jwt, str):
+        raw_jwt = str(raw_jwt)
+
     access_token = OAuthToken.create_access_token(
         client_id=client.client_id,
         user_id=user.uid,
         tenant_id=tenant.uid,
         scope=scope,
         expires_in=access_expires_in,
+        raw_token=raw_jwt,
     )
     await access_token.save()
 
@@ -804,6 +866,56 @@ async def register_client(
         client_id_issued_at=int(time.time()),
         client_secret_expires_at=0,
     )
+
+
+DYNAMIC_REGISTRATION_USER_ID = "dynamic-registration"
+
+
+async def register_public_client(
+    request: PublicClientRegistrationSchema, tenant: Tenant
+) -> dict[str, object]:
+    """
+    Register an unauthenticated public PKCE client (RFC 7591).
+
+    Safe by construction: no secret, PKCE and consent always required, scopes
+    clamped to the user-level set, no owner privileges.
+    """
+    requested = request.scope.split() if request.scope else []
+    scopes = [s for s in PUBLIC_CLIENT_SCOPES if not requested or s.value in requested]
+    if not scopes:
+        scopes = [Scope.OPENID]
+    client = OAuthClient(
+        client_id=OAuthClient.generate_client_id(),
+        client_secret=None,
+        client_name=request.client_name,
+        client_type="public",
+        redirect_uris=request.redirect_uris,
+        allowed_scopes=scopes,
+        grant_types=request.grant_types,
+        response_types=request.response_types,
+        logo_uri=request.logo_uri,
+        client_uri=request.client_uri,
+        policy_uri=request.policy_uri,
+        tos_uri=request.tos_uri,
+        require_pkce=True,
+        require_consent=True,
+        token_endpoint_auth_method="none",  # ruff:ignore[hardcoded-password-func-arg]
+        tenant_id=tenant.uid,
+        # Sentinel, not the tenant owner: nobody may manage an anonymous client
+        # through the owner-only client endpoints (and it marks them for cleanup).
+        user_id=DYNAMIC_REGISTRATION_USER_ID,
+    )
+    await client.save()
+    return {
+        "client_id": client.client_id,
+        "client_id_issued_at": int(time.time()),
+        "client_name": client.client_name,
+        "redirect_uris": client.redirect_uris,
+        "grant_types": [str(g) for g in client.grant_types],
+        "response_types": [str(r) for r in client.response_types],
+        "token_endpoint_auth_method": "none",
+        "scope": " ".join(s.value for s in scopes),
+    }
 
 
 async def revoke_token(token: str, client: OAuthClient, tenant: Tenant) -> None:

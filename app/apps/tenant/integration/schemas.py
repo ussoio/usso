@@ -8,7 +8,7 @@ authorization server functionality.
 import ipaddress
 from enum import StrEnum
 from typing import Literal, Self
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 from fastapi_mongo_base.schemas import TenantUserEntitySchema
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -52,34 +52,63 @@ class Scope(StrEnum):
     OPENID = "openid"
     PROFILE = "profile"
     EMAIL = "email"
+    READ = "read"
+    WRITE = "write"
 
 
 class ClientType(StrEnum):
     """OAuth2 Client Types."""
 
     CONFIDENTIAL = "confidential"
+    PUBLIC = "public"
 
 
-def validate_redirect_uris(uris: list[str]) -> list[str]:
-    """Require exact web redirects and permit plain HTTP only on loopback."""
+def _validate_web_redirect(parsed: ParseResult, uri: str) -> None:
+    """Validate http/https redirect URIs."""
+    if not parsed.netloc or not parsed.hostname:
+        raise ValueError(f"Invalid redirect URI: {uri}")
+    if parsed.scheme == "http":
+        hostname = parsed.hostname.lower()
+        try:
+            is_loopback = ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            is_loopback = hostname == "localhost"
+        if not is_loopback:
+            raise ValueError("HTTP redirect URIs are allowed only on loopback")
+
+
+def _validate_native_redirect(
+    parsed: ParseResult, uri: str, *, require_reverse_dns: bool = True
+) -> None:
+    """Validate RFC 8252 native app scheme redirect URIs."""
+    scheme = parsed.scheme.lower()
+    disallowed = {"javascript", "data", "vbscript", "file", "ftp", "mailto", "about"}
+    if scheme in disallowed:
+        raise ValueError(f"Scheme not permitted in redirect URI: {uri}")
+    if require_reverse_dns and "." not in scheme and not scheme.startswith("app"):
+        raise ValueError(
+            f"Custom scheme redirect URI must use reverse-DNS notation: {uri}"
+        )
+    if not parsed.path and not parsed.netloc:
+        raise ValueError(f"Invalid redirect URI: {uri}")
+
+
+def validate_redirect_uris(
+    uris: list[str], *, require_reverse_dns: bool = True
+) -> list[str]:
+    """Require exact web or native RFC 8252 redirects."""
     if not uris:
         raise ValueError("At least one redirect URI is required")
     for uri in uris:
         parsed = urlparse(uri)
-        if not parsed.scheme or not parsed.netloc or not parsed.hostname:
+        if not parsed.scheme or parsed.username or parsed.password or parsed.fragment:
             raise ValueError(f"Invalid redirect URI: {uri}")
-        if parsed.username or parsed.password or parsed.fragment:
-            raise ValueError(f"Invalid redirect URI: {uri}")
-        if parsed.scheme not in {"http", "https"}:
-            raise ValueError(f"Invalid scheme in redirect URI: {uri}")
-        if parsed.scheme == "http":
-            hostname = parsed.hostname.lower()
-            try:
-                is_loopback = ipaddress.ip_address(hostname).is_loopback
-            except ValueError:
-                is_loopback = hostname == "localhost"
-            if not is_loopback:
-                raise ValueError("HTTP redirect URIs are allowed only on loopback")
+        if parsed.scheme in {"http", "https"}:
+            _validate_web_redirect(parsed, uri)
+        else:
+            _validate_native_redirect(
+                parsed, uri, require_reverse_dns=require_reverse_dns
+            )
     return uris
 
 
@@ -87,8 +116,8 @@ class OAuthClientSchema(TenantUserEntitySchema):
     """OAuth2 Client configuration schema."""
 
     client_id: str = Field(..., description="Unique client identifier")
-    client_secret: str = Field(
-        ..., description="Client secret (for confidential clients)"
+    client_secret: str | None = Field(
+        None, description="Client secret (for confidential clients)"
     )
     client_name: str = Field(..., description="Human-readable client name")
     client_type: ClientType = Field(
@@ -124,11 +153,17 @@ class OAuthClientSchema(TenantUserEntitySchema):
     require_pkce: bool = Field(
         True, description="Require PKCE for authorization code flow"
     )
-    token_endpoint_auth_method: Literal["client_secret_basic", "client_secret_post"] = (
-        Field(
-            default="client_secret_basic",
-            description="Token endpoint authentication method",
-        )
+    require_consent: bool = Field(
+        True,
+        description=(
+            "Whether user consent is required before issuing authorization code"
+        ),
+    )
+    token_endpoint_auth_method: Literal[
+        "client_secret_basic", "client_secret_post", "none"
+    ] = Field(
+        default="client_secret_basic",
+        description="Token endpoint authentication method",
     )
 
     @field_validator("require_pkce", mode="before")
@@ -376,6 +411,55 @@ class ClientRegistrationResponseSchema(OAuthClientSchema):
     registration_access_token: str = Field(..., description="Registration access token")
 
 
+PUBLIC_CLIENT_SCOPES = (Scope.OPENID, Scope.PROFILE, Scope.READ, Scope.WRITE)
+
+
+class PublicClientRegistrationSchema(BaseModel):
+    """
+    RFC 7591 open registration for public PKCE clients (MCP agents).
+
+    Unknown metadata is ignored because agents send varying optional fields.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    client_name: str = Field(..., min_length=1, max_length=200)
+    redirect_uris: list[str] = Field(...)
+    grant_types: list[GrantType] = Field(default=[GrantType.AUTHORIZATION_CODE])
+    response_types: list[ResponseType] = Field(default=[ResponseType.CODE])
+    token_endpoint_auth_method: Literal["none"] = "none"
+    scope: str | None = None
+    logo_uri: str | None = None
+    client_uri: str | None = None
+    policy_uri: str | None = None
+    tos_uri: str | None = None
+
+    @field_validator("redirect_uris")
+    @classmethod
+    def validate_redirect_uris(cls, value: list[str]) -> list[str]:
+        """
+        Exact-match redirects; IDE agents use short schemes like cursor://.
+
+        Consent is always required, so a custom scheme alone grants nothing.
+        """
+        return validate_redirect_uris(value, require_reverse_dns=False)
+
+    @field_validator("grant_types")
+    @classmethod
+    def validate_grant_types(cls, value: list[GrantType]) -> list[GrantType]:
+        """Open registration may only use the user-delegated code flow."""
+        allowed = {GrantType.AUTHORIZATION_CODE, GrantType.REFRESH_TOKEN}
+        if not value or not set(value) <= allowed:
+            raise ValueError("Only authorization_code and refresh_token are allowed")
+        return value
+
+    @field_validator("logo_uri", "client_uri", "policy_uri", "tos_uri")
+    @classmethod
+    def validate_metadata_uri(cls, value: str | None) -> str | None:
+        """Allow only non-credentialed HTTPS client metadata URLs."""
+        return validate_external_https_url(value)
+
+
 class ClientUpdateSchema(BaseModel):
     """Schema for updating OAuth client (partial update)."""
 
@@ -396,6 +480,12 @@ class ClientUpdateSchema(BaseModel):
     tos_uri: str | None = Field(None, description="Terms of service URI")
     require_pkce: Literal[True] | None = Field(
         None, description="Require PKCE for authorization code flow"
+    )
+    require_consent: bool | None = Field(
+        None,
+        description=(
+            "Whether user consent is required before issuing authorization code"
+        ),
     )
     token_endpoint_auth_method: (
         Literal["client_secret_basic", "client_secret_post"] | None

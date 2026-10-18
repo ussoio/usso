@@ -127,9 +127,35 @@ def validate_national_code(national_code: str) -> bool:
     return check_digit == (11 - remainder)
 
 
+# Arabic-Indic digits (U+0660..U+0669); persiantools only converts Persian ones.
+_ARABIC_INDIC_TO_ASCII = {0x0660 + i: 0x30 + i for i in range(10)}
+
+
 def validate_organization_code(organization_code: str) -> bool:
-    """Validate an organization code."""
-    return organization_code.isdigit() and len(organization_code) == 11
+    """Validate an organization code (exactly 11 ASCII digits)."""
+    return (
+        organization_code.isascii()
+        and organization_code.isdigit()
+        and len(organization_code) == 11
+    )
+
+
+def normalize_organization_code(value: str | None) -> str | None:
+    """
+    Return the organization code as 11 ASCII digits, or None when absent.
+
+    Persian and Arabic-Indic digits are converted. Raises ValueError when a
+    value is present but is not exactly 11 digits.
+    """
+    if value is None:
+        return None
+    text = fa_to_en(str(value)).translate(_ARABIC_INDIC_TO_ASCII).strip()
+    if not text:
+        return None
+    if not validate_organization_code(text):
+        msg = "organization_code must be exactly 11 digits"
+        raise ValueError(msg)
+    return text
 
 
 def validate_phone_national_code_organization_birth_date(

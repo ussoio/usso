@@ -5,8 +5,12 @@ This module provides endpoints for user authentication including login,
 logout, password reset, OTP, magic links, passkeys, QR code login, and OAuth.
 """
 
+import json
 import logging
+import secrets
+import urllib.parse
 from datetime import datetime
+from types import SimpleNamespace
 
 from fastapi import (
     APIRouter,
@@ -23,7 +27,8 @@ from usso.utils.validators import determine_identifier_type
 
 from apps.captcha.dependencies import check_captcha
 from apps.tenant.services import get_request_tenant
-from server.exceptions import BadRequestError, UnauthorizedError
+from server.db import redis
+from server.exceptions import BadRequestError, ForbiddenError, UnauthorizedError
 from server.rate_limiter import get_rate_limiter
 from utils.net import get_client_ip
 
@@ -51,6 +56,7 @@ from .schemas import (
     RefreshResponse,
     ResetPasswordRequest,
     SecureTokenRequest,
+    TokenType,
     VerifyTokenRequest,
     WorkspaceLoginRequest,
 )
@@ -97,6 +103,65 @@ from .services import (
 from .services.oauth import OAuthIdentity
 
 logger = logging.getLogger(__name__)
+
+_OAUTH_HANDOFF_TTL_SECONDS = 60
+
+
+def _oauth_handoff_key(code: str) -> str:
+    return f"auth:oauth-handoff:{code}"
+
+
+async def _create_oauth_handoff(
+    *, tenant: object, payloads: dict, status: LoginStatus
+) -> str:
+    """
+    Store browser credentials behind a short-lived, single-use handoff code.
+
+    An OAuth callback cannot set cookies for another registrable domain.  The
+    destination frontend redeems this opaque code through its own BFF, which
+    sets the normal HttpOnly cookies without exposing tokens in the URL.
+    """
+    code = secrets.token_urlsafe(32)
+    value = {
+        "tenant_id": tenant.uid,
+        "status": status.value,
+        "payloads": {
+            key.value: value.model_dump(mode="json") for key, value in payloads.items()
+        },
+    }
+    await redis.set(
+        _oauth_handoff_key(code), json.dumps(value), ex=_OAUTH_HANDOFF_TTL_SECONDS
+    )
+    return code
+
+
+def _append_handoff_code(return_url: str, code: str) -> str:
+    parsed = urllib.parse.urlsplit(return_url)
+    query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    query.append(("oauth_handoff", code))
+    return urllib.parse.urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        urllib.parse.urlencode(query),
+        parsed.fragment,
+    ))
+
+
+async def _maybe_add_oauth_handoff(
+    *,
+    request: Request,
+    tenant: object,
+    payloads: dict,
+    status: LoginStatus,
+    return_url: str | None,
+) -> str | None:
+    if not return_url or request.cookies.get("usso_oauth_handoff") != "true":
+        return return_url
+    handoff_code = await _create_oauth_handoff(
+        tenant=tenant, payloads=payloads, status=status
+    )
+    return _append_handoff_code(return_url, handoff_code)
 
 
 def _resolve_oauth_callback_identity(
@@ -219,6 +284,8 @@ async def login_attempt(
             user=result.user,
             amr=[],
         ),
+        user_agent=request.headers.get("user-agent"),
+        ip=get_client_ip(request),
         url=request.url,
     )
 
@@ -284,7 +351,7 @@ async def login(
 
     tenant = await get_request_tenant(request)
 
-    temporary_payload = tenant.temporary_auth(request)
+    temporary_payload = tenant.optional_user(request)
 
     # Process login flow
     login_flow_result = await process_login_flow(
@@ -679,7 +746,7 @@ async def generate_passkey(
     from ..user import credential_services
 
     tenant = await get_request_tenant(request)
-    temporary_payload = tenant.temporary_auth(request)
+    temporary_payload = tenant.optional_user(request)
     return await credential_services.generate_authentication_challenge(
         tenant=tenant,
         user_id=temporary_payload.user_id if temporary_payload else None,
@@ -875,25 +942,10 @@ async def issue_secure_token(
     auth method (OTP / TOTP / magic-link / passkey). Does not create a new
     login session — only attaches ``usso-secure-token``.
     """
-    from usso.user import TokenType
-
     from ..user.services import authenticate_user, find_user
-    from .services.token import (
-        attach_auth_cookies_to_response,
-        is_cookie_auth_preferred,
-    )
 
     tenant = await get_request_tenant(request)
-    access_user = tenant.access_auth(request)
-    if access_user is None:
-        raise UnauthorizedError(
-            error_code="authentication_required",
-            detail="Authentication required",
-            message={
-                "en": "You must be signed in.",
-                "fa": "برای این کار باید وارد شوید.",
-            },
-        )
+    access_user = _require_access_user(request, tenant)
 
     if not is_secure_method(data.method):
         raise BadRequestError(
@@ -933,15 +985,23 @@ async def issue_secure_token(
         )
 
     amr = [data.method.value] if data.method else []
-    secure_payload = create_secure_token_payload(
-        user=user,
-        tenant=tenant,
-        amr=amr,
-    )
-    payloads = {TokenType.SECURE_TOKEN: secure_payload}
+    return _secure_token_response(request=request, tenant=tenant, user=user, amr=amr)
 
+
+def _secure_token_response(
+    *, request: Request, tenant: object, user: User, amr: list[str]
+) -> Response:
+    """Return a step-up response carrying only ``usso-secure-token``."""
     from fastapi.responses import JSONResponse
+    from usso.user import TokenType
 
+    from .services.token import (
+        attach_auth_cookies_to_response,
+        is_cookie_auth_preferred,
+    )
+
+    secure_payload = create_secure_token_payload(user=user, tenant=tenant, amr=amr)
+    payloads = {TokenType.SECURE_TOKEN: secure_payload}
     prefer_cookie = is_cookie_auth_preferred(
         request=request,
         tenant_cookie=tenant.config.cookie_header_config.header_or_cookie == "cookie",
@@ -961,6 +1021,79 @@ async def issue_secure_token(
             domain=request.url.hostname,
         )
     return response
+
+
+def _require_access_user(request: Request, tenant: object) -> object:
+    access_user = tenant.access_auth(request)
+    if access_user is None:
+        raise UnauthorizedError(
+            error_code="authentication_required",
+            detail="Authentication required",
+            message={
+                "en": "You must be signed in.",
+                "fa": "برای این کار باید وارد شوید.",
+            },
+        )
+    return access_user
+
+
+@router_limited.get("/secure-token/passkey")
+async def secure_token_passkey_challenge(
+    request: Request,
+    _: None = Depends(get_rate_limiter("/auth/passkey")),
+) -> dict[str, object]:
+    """
+    Issue a WebAuthn challenge for a secure step-up of the signed-in user.
+
+    Only the caller's own passkeys are allowed. No captcha: a passkey
+    assertion already proves possession and is not guessable.
+    """
+    from ..user import credential_services
+
+    tenant = await get_request_tenant(request)
+    access_user = _require_access_user(request, tenant)
+    return await credential_services.generate_authentication_challenge(
+        tenant=tenant,
+        user_id=access_user.uid,
+        hostname=request.url.hostname,
+        origin=request.headers.get("origin"),
+    )
+
+
+@router_limited.post("/secure-token/passkey", response_model=LoginResponse)
+async def secure_token_passkey(
+    request: Request,
+    data: PasskeyAssertion,
+    _: None = Depends(get_rate_limiter("/auth/passkey")),
+) -> Response:
+    """
+    Issue ``usso-secure-token`` from a passkey assertion in one step.
+
+    The assertion must belong to the signed-in user; no OTP or captcha is
+    needed. Does not create a new login session.
+    """
+    from ..user import credential_services
+
+    tenant = await get_request_tenant(request)
+    access_user = _require_access_user(request, tenant)
+    user = await credential_services.verify_authentication_passkey(
+        tenant,
+        data.model_dump(),
+        request.url.hostname,
+        origin=request.headers.get("origin"),
+    )
+    if user.uid != access_user.uid:
+        raise UnauthorizedError(
+            error_code="secure_step_up_failed",
+            detail="Passkey does not belong to the signed-in user",
+            message={
+                "en": "This passkey belongs to another account.",
+                "fa": "این کلید عبور متعلق به حساب دیگری است.",
+            },
+        )
+    return _secure_token_response(
+        request=request, tenant=tenant, user=user, amr=[AuthSecret.WEBAUTHN.value]
+    )
 
 
 @router_limited.get("/secure-token/status")
@@ -992,10 +1125,62 @@ async def secure_token_status(request: Request) -> dict:
             tenant=tenant,
             user_id=access_user.uid,
         )
+    except ForbiddenError:
+        return {"valid": False}
     except UnauthorizedError:
         return {"valid": False}
 
     return {"valid": True, "exp": payload.exp}
+
+
+@router_limited.get("/secure-token/methods")
+async def secure_token_methods(request: Request) -> dict:
+    """
+    List the step-up methods the signed-in user can use right now.
+
+    ``passkey`` needs no captcha; ``otp`` targets verified phone/email and needs
+    captcha; ``oauth`` lists providers linked to the user that support a forced
+    fresh sign-in (Telegram does not).
+    """
+    from ..user.models import UserIdentifier
+    from .services.oauth import supports_oauth_step_up
+
+    tenant = await get_request_tenant(request)
+    access_user = _require_access_user(request, tenant)
+    identifiers = await UserIdentifier.get_query(
+        tenant_id=tenant.uid, user_id=access_user.uid
+    ).to_list()
+    otp = [
+        {"type": str(item.type), "identifier": item.identifier}
+        for item in identifiers
+        if str(item.type) in {"phone", "email"}
+        and item.is_active
+        and item.verified_at is not None
+    ]
+    user = await User.get_item(uid=access_user.uid, tenant_id=tenant.uid)
+    # get_credentials caches per user object regardless of method; bypass it.
+    passkeys = (
+        await user.get_credentials(method=AuthSecret.WEBAUTHN, not_cached=True)
+        if user
+        else None
+    )
+    oauth_creds = (
+        await user.get_credentials(method=AuthSecret.OAUTH, not_cached=True)
+        if user
+        else None
+    )
+    # OAuth credentials do not record the provider name; the callback still
+    # rejects any account other than the signed-in user.
+    oauth = (
+        [
+            provider
+            for provider, secret in tenant.secrets.oauth_secrets.items()
+            if supports_oauth_step_up(provider, secret)
+        ]
+        if oauth_creds
+        else []
+    )
+    return {"passkey": bool(passkeys), "otp": otp, "oauth": oauth}
 
 
 @router_limited.post("/password")
@@ -1115,7 +1300,7 @@ async def login_by_telegram(
     if display_name:
         kwargs["name"] = display_name
 
-    temporary_payload = tenant.temporary_auth(request)
+    temporary_payload = tenant.optional_user(request)
     login_flow_result = await process_login_flow(
         login_request=login_request,
         tenant=tenant,
@@ -1150,9 +1335,20 @@ async def login_by_telegram(
 
 @router_limited.get("/oauth/{provider}/authorize")
 async def oauth_authorize(
-    request: Request, provider: str, return_url: str | None = None
+    request: Request,
+    provider: str,
+    return_url: str | None = None,
+    handoff: bool = False,
+    step_up: bool = False,
 ) -> Response:
-    """OAuth authorize."""
+    """
+    OAuth authorize.
+
+    With ``step_up=true`` a signed-in user re-authenticates with the provider
+    (forced fresh login); the callback then issues ``usso-secure-token``.
+    """
+    from .services.oauth import supports_oauth_step_up
+
     tenant = await get_request_tenant(request)
 
     if provider not in tenant.secrets.oauth_secrets:
@@ -1164,9 +1360,22 @@ async def oauth_authorize(
                 "fa": "سرویس ورود انتخاب‌شده معتبر نیست.",
             },
         )
+    if step_up:
+        _require_access_user(request, tenant)
+        if not supports_oauth_step_up(
+            provider, tenant.secrets.oauth_secrets.get(provider)
+        ):
+            raise BadRequestError(
+                error_code="step_up_not_supported",
+                detail="This provider cannot be used for secure verification",
+                message={
+                    "en": "Use a code or a passkey to verify with this account.",
+                    "fa": "برای تأیید امن از کد یک‌بارمصرف یا کلید عبور استفاده کنید.",
+                },
+            )
 
     session = await create_oauth_session(
-        tenant=tenant, provider=provider, url=request.url
+        tenant=tenant, provider=provider, url=request.url, step_up=step_up
     )
 
     safe_return_url = sanitize_return_url(
@@ -1210,20 +1419,109 @@ async def oauth_authorize(
             max_age=300,
             samesite="lax",
         )
+    if handoff and safe_return_url:
+        response.set_cookie(
+            "usso_oauth_handoff",
+            "true",
+            httponly=True,
+            secure=True,
+            max_age=300,
+            samesite="lax",
+        )
+    if step_up:
+        # Bound to this authorize request's state; checked in the callback.
+        response.set_cookie(
+            "usso_oauth_step_up",
+            session.state,
+            httponly=True,
+            secure=True,
+            max_age=300,
+            samesite="lax",
+        )
     return response
 
 
-@router_limited.get("/oauth/{provider}/callback")
-async def oauth_callback(
-    request: Request,
-    response: Response,
-    provider: str,
-    state: str,
-    code: str,
-) -> Response:
-    """OAuth callback."""
-    tenant = await get_request_tenant(request)
+def _is_oauth_step_up(request: Request, state: str) -> bool:
+    """Return True when this callback finishes a ``step_up`` authorize request."""
+    step_up_state = request.cookies.get("usso_oauth_step_up")
+    return bool(step_up_state) and secrets.compare_digest(step_up_state, state)
 
+
+async def _oauth_step_up_response(
+    *,
+    request: Request,
+    tenant: object,
+    identity: OAuthIdentity,
+    userinfo: dict,
+) -> Response:
+    """
+    Finish an OAuth re-login used as a secure step-up.
+
+    Requires the same signed-in user and a fresh provider authentication
+    (``auth_time``); issues only ``usso-secure-token`` and keeps the session.
+    """
+    from ..user.services import find_user
+    from .services.oauth import is_fresh_oauth_authentication
+
+    access_user = _require_access_user(request, tenant)
+    # Same lookup the login flow uses for this provider identity (no
+    # re-validation: the id_token already proved it).
+    user = await find_user(
+        identifier=SimpleNamespace(
+            type=identity.identifier_type, identifier=identity.identifier
+        ),
+        tenant_id=tenant.uid,
+        tenant=tenant,
+    )
+    now = int(datetime.now(timezone.tz).timestamp())
+    if user is None or user.uid != access_user.uid:
+        raise UnauthorizedError(
+            error_code="secure_step_up_failed",
+            detail="OAuth account does not belong to the signed-in user",
+            message={
+                "en": "Sign in with the account linked to this profile.",
+                "fa": "با همان حسابی وارد شوید که به این پروفایل متصل است.",
+            },
+        )
+    if not is_fresh_oauth_authentication(userinfo, now=now):
+        raise UnauthorizedError(
+            error_code="secure_step_up_not_fresh",
+            detail="Provider did not confirm a fresh sign-in",
+            message={
+                "en": (
+                    "The provider did not confirm a fresh sign-in. Use a code instead."
+                ),
+                "fa": "ورود تازه تأیید نشد. از کد یک‌بارمصرف استفاده کنید.",
+            },
+        )
+    response = _secure_token_response(
+        request=request, tenant=tenant, user=user, amr=[AuthSecret.OAUTH.value]
+    )
+    redirect_url = sanitize_return_url(
+        request.cookies.get("usso_oauth_return_url"), tenant
+    ) or sanitize_return_url(tenant.config.default_redirect_url, tenant)
+    final_response: Response = response
+    if redirect_url:
+        final_response = RedirectResponse(redirect_url)
+        for header, value in response.raw_headers:
+            if header.lower() == b"set-cookie":
+                final_response.raw_headers.append((header, value))
+    for cookie in (
+        "usso_oidc_state",
+        "usso_oidc_verifier",
+        "usso_oidc_nonce",
+        "usso_oauth_return_url",
+        "usso_oauth_handoff",
+        "usso_oauth_step_up",
+    ):
+        final_response.delete_cookie(cookie)
+    return final_response
+
+
+def _validate_oauth_callback(
+    *, request: Request, tenant: object, provider: str, state: str
+) -> tuple[str | None, str]:
+    """Check provider, state and nonce cookies; return (verifier, nonce)."""
     if provider not in tenant.secrets.oauth_secrets:
         raise BadRequestError(
             error_code="invalid_provider",
@@ -1252,6 +1550,35 @@ async def oauth_callback(
             error_code="invalid_nonce",
             detail="Missing OIDC nonce cookie",
         )
+    return code_verifier, expected_nonce
+
+
+@router_limited.get("/oauth/{provider}/callback")
+async def oauth_callback(
+    request: Request,
+    response: Response,
+    provider: str,
+    state: str | None = None,
+    code: str | None = None,
+    error: str | None = None,
+) -> Response:
+    """OAuth callback."""
+    tenant = await get_request_tenant(request)
+
+    if error or not code:
+        # The user cancelled or the provider refused (RFC 6749 §4.1.2.1).
+        raise BadRequestError(
+            error_code="oauth_cancelled",
+            detail=f"OAuth provider returned error: {error or 'missing code'}",
+            message={
+                "en": "Sign-in was cancelled. Please try again.",
+                "fa": "ورود لغو شد. دوباره تلاش کنید.",
+            },
+        )
+
+    code_verifier, expected_nonce = _validate_oauth_callback(
+        request=request, tenant=tenant, provider=provider, state=state
+    )
     id_token, userinfo, jwks_uri = await exchange_oauth_code_for_userinfo(
         code=code,
         tenant=tenant,
@@ -1266,6 +1593,11 @@ async def oauth_callback(
         userinfo=userinfo,
         secrets_data=tenant.secrets.oauth_secrets.get(provider),
     )
+
+    if _is_oauth_step_up(request, state):
+        return await _oauth_step_up_response(
+            request=request, tenant=tenant, identity=identity, userinfo=userinfo
+        )
 
     await create_oauth_credential(
         tenant=tenant,
@@ -1291,7 +1623,7 @@ async def oauth_callback(
     if identity.name:
         login_kwargs["name"] = identity.name
 
-    temporary_payload = tenant.temporary_auth(request)
+    temporary_payload = tenant.optional_user(request)
     login_flow_result = await process_login_flow(
         login_request=login_request,
         tenant=tenant,
@@ -1326,6 +1658,14 @@ async def oauth_callback(
         request.cookies.get("usso_oauth_return_url"), tenant
     ) or sanitize_return_url(tenant.config.default_redirect_url, tenant)
 
+    redirect_url = await _maybe_add_oauth_handoff(
+        request=request,
+        tenant=tenant,
+        payloads=payloads,
+        status=login_flow_result.status,
+        return_url=redirect_url,
+    )
+
     final_response: Response
     if redirect_url:
         final_response = RedirectResponse(redirect_url)
@@ -1339,7 +1679,47 @@ async def oauth_callback(
     final_response.delete_cookie("usso_oidc_verifier")
     final_response.delete_cookie("usso_oidc_nonce")
     final_response.delete_cookie("usso_oauth_return_url")
+    final_response.delete_cookie("usso_oauth_handoff")
+    final_response.delete_cookie("usso_oauth_step_up")
     return final_response
+
+
+@router_limited.post("/oauth/handoff")
+async def redeem_oauth_handoff(request: Request, code: str) -> Response:
+    """Redeem an OAuth cross-domain handoff exactly once."""
+    tenant = await get_request_tenant(request)
+    raw = await redis.getdel(_oauth_handoff_key(code))
+    if not raw:
+        raise UnauthorizedError(
+            error_code="oauth_handoff_invalid",
+            detail="OAuth handoff has expired or was already used.",
+        )
+    if isinstance(raw, bytes):
+        raw = raw.decode()
+    try:
+        stored = json.loads(raw)
+        payloads = {
+            TokenType(token_type): PayloadData.model_validate(payload)
+            for token_type, payload in stored["payloads"].items()
+        }
+        login_status = LoginStatus(stored["status"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise UnauthorizedError(
+            error_code="oauth_handoff_invalid",
+            detail="OAuth handoff is invalid.",
+        ) from exc
+    if stored.get("tenant_id") != tenant.uid:
+        raise UnauthorizedError(
+            error_code="oauth_handoff_invalid",
+            detail="OAuth handoff is invalid.",
+        )
+
+    return await build_browser_login_response(
+        request=request,
+        tenant=tenant,
+        payloads=payloads,
+        status=login_status,
+    )
 
 
 @router_limited.post("/verify-token", response_model=PayloadData)

@@ -121,12 +121,8 @@ async def test_resolve_user_for_national_code_attaches_phone_to_existing() -> No
             "find_one",
             new=AsyncMock(return_value=national_row),
         ),
-        patch.object(
-            services.User, "get_item", new=AsyncMock(return_value=existing)
-        ),
-        patch.object(
-            services, "attach_phone_to_user", new=AsyncMock()
-        ) as attach,
+        patch.object(services.User, "get_item", new=AsyncMock(return_value=existing)),
+        patch.object(services, "attach_phone_to_user", new=AsyncMock()) as attach,
         patch.object(
             services, "retire_orphaned_merge_source", new=AsyncMock()
         ) as retire,

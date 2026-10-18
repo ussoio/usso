@@ -72,6 +72,13 @@ class Settings(config.Settings):
     )
 
     sentry_dsn: str | None = os.getenv("SENTRY_DSN")
+    # Resource servers that tokens of openly
+    # registered clients are also issued for, as extra ``aud`` values.
+    dynamic_client_audiences: tuple[str, ...] = tuple(
+        a.strip()
+        for a in os.getenv("OAUTH_DYNAMIC_CLIENT_AUDIENCES", "").split(",")
+        if a.strip()
+    )
 
     @classmethod
     def get_log_config(cls, console_level: str = "INFO", **kwargs: object) -> dict:
@@ -92,8 +99,9 @@ class Settings(config.Settings):
             "disable_existing_loggers": False,
             "formatters": {
                 "standard": {
-                    "format": "[{levelname} {name} : {filename}:{lineno} : {asctime} -> {funcName:10}] {message}",  # ruff:ignore[line-too-long]
+                    "format": "[{levelname} {name} : {filename}:{lineno} : {asctime} -> {funcName:10}] [trace={trace_id}] {message}",  # ruff:ignore[line-too-long]
                     "style": "{",
+                    "defaults": {"trace_id": "-"},
                 }
             },
             "handlers": {

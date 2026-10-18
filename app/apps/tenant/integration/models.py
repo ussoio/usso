@@ -207,11 +207,12 @@ class OAuthToken(TenantUserEntity):
         tenant_id: str,
         scope: list[str],
         expires_in: int = 3600,  # 1 hour
+        raw_token: str | None = None,
     ) -> Self:
         """Create a new access token."""
-        raw_token = cls.generate_token()
+        token_str = raw_token or cls.generate_token()
         item = cls(
-            token=hashlib.sha256(raw_token.encode()).hexdigest(),
+            token=hashlib.sha256(token_str.encode()).hexdigest(),
             token_type=TokenType.BEARER,
             client_id=client_id,
             user_id=user_id,
@@ -219,7 +220,7 @@ class OAuthToken(TenantUserEntity):
             scope=scope,
             expires_at=datetime.now(timezone.tz) + timedelta(seconds=expires_in),
         )
-        item._raw_token = raw_token
+        item._raw_token = token_str
         return item
 
     @classmethod
@@ -365,6 +366,65 @@ class OAuthSession(TenantUserEntity):
         """Grant user consent for the requested scopes."""
         self.is_consented = True
         self.granted_scope = granted_scope
+
+
+class UserConsent(TenantUserEntity):
+    """Persistent grant of scopes by a user to an OAuth client."""
+
+    client_id: str = Field(..., description="Client ID")
+    scopes: list[str] = Field(default_factory=list, description="Granted scopes")
+
+    class Settings:
+        """Settings for the user consent model."""
+
+        keep_nulls = False
+        validate_on_save = True
+
+        indexes: ClassVar[list[IndexModel]] = [
+            *TenantUserEntity.Settings.indexes,
+            IndexModel(
+                [
+                    ("tenant_id", ASCENDING),
+                    ("user_id", ASCENDING),
+                    ("client_id", ASCENDING),
+                ],
+                unique=True,
+            ),
+        ]
+
+    @classmethod
+    async def covers(
+        cls, tenant_id: str, user_id: str, client_id: str, scopes: list[str]
+    ) -> bool:
+        """Return True if a stored grant includes every requested scope."""
+        consent = await cls.find_one({
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "client_id": client_id,
+        })
+        return consent is not None and set(scopes) <= set(consent.scopes)
+
+    @classmethod
+    async def grant(
+        cls, tenant_id: str, user_id: str, client_id: str, scopes: list[str]
+    ) -> Self:
+        """Create or widen the stored grant with the given scopes."""
+        consent = await cls.find_one({
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "client_id": client_id,
+        })
+        if consent is None:
+            consent = cls(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                client_id=client_id,
+                scopes=sorted(set(scopes)),
+            )
+        else:
+            consent.scopes = sorted(set(consent.scopes) | set(scopes))
+        await consent.save()
+        return consent
 
 
 class OuathDeviceAuthorization(TenantUserEntity):

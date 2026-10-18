@@ -26,7 +26,12 @@ def test_oauth_client_redirect_uri_validator_rejects_invalid_values(
 
 
 def test_oauth_client_redirect_uri_validator_accepts_http_and_https() -> None:
-    uris = ["https://app.test/callback", "http://localhost:8000/callback"]
+    uris = [
+        "https://app.test/callback",
+        "http://localhost:8000/callback",
+        "ir.getmirza.flow:/oauth",
+        "ir.getmirza.flow://oauth",
+    ]
     assert OAuthClientSchema.validate_redirect_uris(uris) is uris
 
 

@@ -699,9 +699,7 @@ async def test_upsert_admin_kyc_creates_or_updates_record() -> None:
             "find_one",
             new=AsyncMock(return_value=national),
         ),
-        patch.object(
-            services.KYC, "find_one", new=AsyncMock(return_value=existing)
-        ),
+        patch.object(services.KYC, "find_one", new=AsyncMock(return_value=existing)),
     ):
         await services.upsert_admin_kyc(user=user, birth_date=date(2001, 8, 29))
     assert existing.birth_date == date(2001, 8, 29)

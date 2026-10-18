@@ -128,6 +128,26 @@ async def test_password_or_otp_flow_without_password_user(
 
 
 @pytest.mark.asyncio
+async def test_password_or_otp_flow_accepts_email_identifier(
+    mock_tenant: MagicMock,
+    mock_user: MagicMock,
+    identifier_email: Identifier,
+) -> None:
+    mock_tenant.config.auth.login_flow = PASSWORD_OR_OTP
+    with patch(
+        "apps.identity.auth.services.login_flow.find_user",
+        return_value=mock_user,
+    ):
+        result = await resolve_login_attempt(
+            identifier=identifier_email, tenant=mock_tenant
+        )
+
+    assert result.next_step is not None
+    assert AuthSecret.EMAIL_OTP in result.next_step.methods
+    assert result.otp_delivery[AuthSecret.EMAIL_OTP] == OTPDeliveryStatus.REQUESTABLE
+
+
+@pytest.mark.asyncio
 async def test_user_not_found_registration_allowed(
     mock_tenant: MagicMock,
     identifier_email: Identifier,
@@ -223,3 +243,66 @@ async def test_passwordless_flow_auto_sends_otp(
         assert (
             result.otp_delivery[AuthSecret.EMAIL_OTP] == OTPDeliveryStatus.REQUESTABLE
         )
+
+
+@pytest.mark.asyncio
+async def test_password_or_otp_flow_phone_identifier_drops_email_otp(
+    mock_tenant: MagicMock,
+    mock_user: MagicMock,
+    identifier_phone: Identifier,
+) -> None:
+    """A phone cannot receive an email code, so EMAIL_OTP is not offered."""
+    mock_tenant.config.auth.login_flow = PASSWORD_OR_OTP
+    with patch(
+        "apps.identity.auth.services.login_flow.find_user",
+        return_value=mock_user,
+    ):
+        result = await resolve_login_attempt(
+            identifier=identifier_phone, tenant=mock_tenant
+        )
+
+    assert result.next_step is not None
+    assert AuthSecret.EMAIL_OTP not in result.next_step.methods
+    assert AuthSecret.PHONE_OTP in result.next_step.methods
+    assert AuthSecret.PASSWORD in result.next_step.methods
+
+
+@pytest.mark.asyncio
+async def test_password_or_otp_flow_email_identifier_drops_phone_otp(
+    mock_tenant: MagicMock,
+    mock_user: MagicMock,
+    identifier_email: Identifier,
+) -> None:
+    mock_tenant.config.auth.login_flow = PASSWORD_OR_OTP
+    with patch(
+        "apps.identity.auth.services.login_flow.find_user",
+        return_value=mock_user,
+    ):
+        result = await resolve_login_attempt(
+            identifier=identifier_email, tenant=mock_tenant
+        )
+
+    assert result.next_step is not None
+    assert AuthSecret.PHONE_OTP not in result.next_step.methods
+    assert AuthSecret.PHONE_OTP not in result.otp_delivery
+
+
+@pytest.mark.asyncio
+async def test_passwordless_flow_keeps_non_delivery_methods(
+    mock_tenant: MagicMock, mock_user: MagicMock
+) -> None:
+    """Identifier filtering must not strip passkey or magic link for email."""
+    mock_tenant.config.auth.login_flow = PASSWORDLESS_FLOW
+    identifier = Identifier(type=AuthIdentifier.EMAIL, identifier="test@uln.me")
+    with patch(
+        "apps.identity.auth.services.login_flow.find_user",
+        return_value=mock_user,
+    ):
+        result = await resolve_login_attempt(identifier=identifier, tenant=mock_tenant)
+
+    assert result.next_step is not None
+    assert set(result.next_step.methods) == {
+        AuthSecret.MAGIC_LINK,
+        AuthSecret.EMAIL_OTP,
+        AuthSecret.WEBAUTHN,
+    }

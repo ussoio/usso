@@ -6,17 +6,21 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from apps.captcha.schemas import ValidationRequest
+from apps.captcha.schemas import IMAGE_CODE_SALT_PREFIX, ValidationRequest, code_key
 
 
 def _validation_request(
-    signature: str = "sig123", *, cookie_code: str | None = None
+    signature: str = "sig123",
+    *,
+    cookie_code: str | None = None,
+    image: bool = True,
 ) -> ValidationRequest:
+    prefix = IMAGE_CODE_SALT_PREFIX if image else ""
     payload = {
         "algorithm": "SHA-256",
         "challenge": "abc",
         "max_number": 10,
-        "salt": "s_iat=1?expires=9999999999",
+        "salt": f"{prefix}s_iat=1?expires=9999999999",
         "signature": signature,
         "number": 0,
         "iat": 1,
@@ -34,9 +38,10 @@ async def test_validate_code_accepts_mixed_case_input() -> None:
     request = _validation_request()
     with patch(
         "apps.captcha.schemas.redis.hget",
-        new=AsyncMock(side_effect=[b"AbCd", b"sig123"]),
-    ):
+        new=AsyncMock(return_value=b"AbCd"),
+    ) as hget:
         assert await request.validate_code("aBcD", fingerprint="fp1") is True
+    hget.assert_awaited_once_with(code_key("sig123"), "code")
 
 
 @pytest.mark.asyncio
@@ -45,20 +50,18 @@ async def test_validate_code_accepts_mixed_case_cookie_payload() -> None:
     request = _validation_request(cookie_code="XyZ9")
     with patch(
         "apps.captcha.schemas.redis.hget",
-        new=AsyncMock(side_effect=[b"xyz9", b"sig123"]),
+        new=AsyncMock(return_value=b"xyz9"),
     ):
         assert await request.validate_code(None, fingerprint="fp1") is True
 
 
 @pytest.mark.asyncio
-async def test_validate_code_ignores_stale_signature_for_fingerprint() -> None:
-    """A leftover image code for another challenge must not fail this verify."""
-    request = _validation_request(signature="sig-current")
-    with patch(
-        "apps.captcha.schemas.redis.hget",
-        new=AsyncMock(side_effect=[b"AbCd", b"sig-other"]),
-    ):
+async def test_validate_code_skips_plain_pow_challenge() -> None:
+    """A challenge without the image marker needs no code."""
+    request = _validation_request(image=False)
+    with patch("apps.captcha.schemas.redis.hget", new=AsyncMock()) as hget:
         assert await request.validate_code(None, fingerprint="fp1") is True
+    hget.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -67,9 +70,9 @@ async def test_validate_code_rejects_wrong_code_for_matching_signature() -> None
     with (
         patch(
             "apps.captcha.schemas.redis.hget",
-            new=AsyncMock(side_effect=[b"AbCd", b"sig123"]),
+            new=AsyncMock(return_value=b"AbCd"),
         ),
         patch("apps.captcha.schemas.redis.delete", new=AsyncMock()) as delete,
     ):
         assert await request.validate_code("nope", fingerprint="fp1") is False
-        delete.assert_awaited_once_with("captcha:code:fp1")
+        delete.assert_awaited_once_with(code_key("sig123"))

@@ -10,7 +10,11 @@ from apps.access_control.role.models import Role
 from apps.identity.auth import enums as auth_enums
 from apps.identity.auth.schemas import LoginRequest
 from apps.identity.user.models import UserIdentifier
-from apps.identity.user.services import create_user
+from apps.identity.user.services import (
+    bootstrap_audit_scope,
+    create_user,
+    record_user_created,
+)
 from apps.tenant.config import (
     AgentConfig,
     AuthenticationConfig,
@@ -181,66 +185,69 @@ async def setup(request: Request, setup_data: SetupRequest) -> Response:
 
     # auth=AuthenticationConfig(login_flow=auth_enums.GOOGLE_FLOW)  # ruff:ignore[commented-out-code]
 
-    user = await create_user(
-        name=setup_data.admin_account.name,
-        login=LoginRequest(
-            type=auth_enums.AuthIdentifier.EMAIL,
-            identifier=setup_data.admin_account.email,
-            method=auth_enums.AuthSecret.PASSWORD,
-            secret=setup_data.admin_account.password,
-        ),
-        tenant=tenant,
-        is_active=True,
-    )
-    user_identifiers = [
-        UserIdentifier(
-            type=auth_enums.AuthIdentifier.USERNAME,
-            identifier=setup_data.admin_account.username,
-            user_id=user.uid,
-            tenant_id=user.tenant_id,
+    with bootstrap_audit_scope(tenant_id=tenant.uid):
+        user = await create_user(
+            name=setup_data.admin_account.name,
+            login=LoginRequest(
+                type=auth_enums.AuthIdentifier.EMAIL,
+                identifier=setup_data.admin_account.email,
+                method=auth_enums.AuthSecret.PASSWORD,
+                secret=setup_data.admin_account.password,
+            ),
+            tenant=tenant,
+            is_active=True,
+            record_audit=False,
         )
-    ]
-    if setup_data.admin_account.phone:
-        user_identifiers.append(
+        user_identifiers = [
             UserIdentifier(
-                type=auth_enums.AuthIdentifier.PHONE,
-                identifier=setup_data.admin_account.phone,
+                type=auth_enums.AuthIdentifier.USERNAME,
+                identifier=setup_data.admin_account.username,
                 user_id=user.uid,
                 tenant_id=user.tenant_id,
             )
-        )
-    roles = [
-        Role(
-            name="admin",
-            description="Admin role",
-            tenant_id="local",
-            scopes=["*:*"],
-        ),
-        Role(
-            name="user",
-            description="User role",
-            tenant_id="local",
-            scopes=[],
-        ),
-    ]
-    user.tenant_id = tenant.uid
-    tenant.user_id = user.uid
-    user.roles = ["admin"]
-    for user_identifier in user_identifiers:
-        user_identifier.user_id = user.uid
-        user_identifier.tenant_id = tenant.uid
+        ]
+        if setup_data.admin_account.phone:
+            user_identifiers.append(
+                UserIdentifier(
+                    type=auth_enums.AuthIdentifier.PHONE,
+                    identifier=setup_data.admin_account.phone,
+                    user_id=user.uid,
+                    tenant_id=user.tenant_id,
+                )
+            )
+        roles = [
+            Role(
+                name="admin",
+                description="Admin role",
+                tenant_id="local",
+                scopes=["*:*"],
+            ),
+            Role(
+                name="user",
+                description="User role",
+                tenant_id="local",
+                scopes=[],
+            ),
+        ]
+        user.tenant_id = tenant.uid
+        tenant.user_id = user.uid
+        user.roles = ["admin"]
+        for user_identifier in user_identifiers:
+            user_identifier.user_id = user.uid
+            user_identifier.tenant_id = tenant.uid
 
-    await tenant.save()
-    await user.save()
-    for role in roles:
-        role.tenant_id = tenant.uid
-        await role.save()
-    for user_identifier in user_identifiers:
-        await user_identifier.save()
+        await tenant.save()
+        await user.save()
+        for role in roles:
+            role.tenant_id = tenant.uid
+            await role.save()
+        for user_identifier in user_identifiers:
+            await user_identifier.save()
 
-    from apps.access_control.workspace.services import ensure_management_workspace
+        from apps.access_control.workspace.services import ensure_management_workspace
 
-    await ensure_management_workspace(tenant=tenant, admin_user=user)
+        await ensure_management_workspace(tenant=tenant, admin_user=user)
+        await record_user_created(user)
 
     return Response(
         status_code=status.HTTP_201_CREATED, content="Setup completed successfully."

@@ -33,7 +33,7 @@ def _challenge() -> SimpleNamespace:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("stored_attempts", "threshold", "show_image"),
-    [(None, 2, False), (b"2", 3, True)],
+    [(None, 2, False), (b"1", 2, False), (b"2", 2, True)],
 )
 async def test_get_challenge_tracks_attempts_and_threshold(
     stored_attempts: bytes | None, threshold: int, show_image: bool
@@ -102,7 +102,9 @@ async def test_get_challenge_altcha_validation_paths(valid: bool) -> None:
     ):
         await routes.get_challenge(request, response)
 
-    validation.assert_awaited_once_with("signed-payload", fingerprint="fingerprint")
+    validation.assert_awaited_once_with(
+        "signed-payload", fingerprint="fingerprint", count_usage=False
+    )
     if valid:
         redis.incr.assert_not_awaited()
         redis.expire.assert_not_awaited()
@@ -120,6 +122,6 @@ async def test_verify_returns_static_success_payload() -> None:
     result = await routes.verify(SimpleNamespace(), payload="verified")
     assert result == {
         "verified": True,
-        "payload": True,
+        "payload": "verified",
         "message": "captcha verified successfully",
     }

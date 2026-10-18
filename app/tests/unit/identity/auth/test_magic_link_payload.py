@@ -33,3 +33,16 @@ def test_generate_random_otp_length() -> None:
     otp = _generate_random_otp(6)
     assert isinstance(otp, int)
     assert 0 <= otp < 1_000_000
+
+
+def test_generate_random_otp_ignores_debug_mode() -> None:
+    """Regression: DEBUG must never turn the OTP into a fixed value."""
+    from unittest.mock import patch
+
+    from server.config import Settings
+
+    with (
+        patch.object(Settings, "debug", True),
+        patch("apps.identity.auth.services.message.secrets.randbelow", return_value=42),
+    ):
+        assert _generate_random_otp(6) == 42

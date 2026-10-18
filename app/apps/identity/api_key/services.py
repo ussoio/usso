@@ -56,9 +56,9 @@ def generate_api_key(uid: uuid.UUID | None = None, secret_length: int = 32) -> d
     Generate a new API key.
 
     Output:
-    - api_key: uak_abcd1234.wxyz9876mnop...
+    - api_key: <generated-id>.<random-secret>
     - api_key_pattern: uak_abcd***
-    - secret: wxyz9876mnop...
+    - secret: <random-secret>
     - hashed_key: a
     """
     bid = b64_encode_uuid_strip(uid)
@@ -134,6 +134,30 @@ def _validate_api_key_state(db_key: APIKey) -> None:
                     "fa": "کلید دسترسی منقضی شده است.",
                 },
             )
+
+
+def enforce_api_key_spend_limit(db_key: APIKey) -> None:
+    """Reject a key whose recorded spend has reached its spend limit."""
+    limit = getattr(db_key, "spend_limit", None)
+    if limit is None:
+        return
+    if float(getattr(db_key, "spend_usage", 0.0) or 0.0) >= limit:
+        raise ForbiddenError(
+            error_code="api_key_spend_limit_exceeded",
+            detail="API key spend limit exceeded.",
+            message={
+                "en": "API key spend limit exceeded.",
+                "fa": "سقف هزینهٔ کلید دسترسی پر شده است.",
+            },
+        )
+
+
+async def record_api_key_spend(uid: str, amount: float) -> None:
+    """Add ``amount`` to the key's spend and drop cached verification."""
+    await APIKey.get_pymongo_collection().update_one(
+        {"uid": uid, "is_deleted": False}, {"$inc": {"spend_usage": amount}}
+    )
+    await invalidate_api_key_cache(uid=uid)
 
 
 def enforce_api_key_ip_whitelist(db_key: APIKey, *, client_ip: str | None) -> None:
@@ -269,6 +293,7 @@ async def verify_api_key(api_key: str) -> tuple[str, APIKey]:
         )
 
     _validate_api_key_state(db_key)
+    enforce_api_key_spend_limit(db_key)
 
     return api_uid, db_key
 
@@ -286,6 +311,8 @@ def api_key_to_user_data(db_key: APIKey, *, jti: str | None = None) -> UserData:
         user_id=db_key.user_id,
         created_by=db_key.created_by,
         sub_type="api_key",
+        spend_limit=getattr(db_key, "spend_limit", None),
+        spend_usage=getattr(db_key, "spend_usage", 0.0),
     )
 
 
@@ -311,6 +338,7 @@ async def get_api_key_data(api_key: str, *, tenant_id: str | None = None) -> Use
         )
     db_key = db_keys[0]
     _validate_api_key_state(db_key)
+    enforce_api_key_spend_limit(db_key)
     if tenant_id is not None and db_key.tenant_id != tenant_id:
         raise UnauthorizedError(
             error_code="api_key_not_found",

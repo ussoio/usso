@@ -71,7 +71,9 @@ async def test_create_child_rejects_personal_parent() -> None:
         pytest.raises(BadRequestError) as exc,
     ):
         await services.create_child_workspace(
-            user_data=_user_data(scopes=["manage:sso/usso/workspace?workspace_id=user-abc"]),
+            user_data=_user_data(
+                scopes=["manage:sso/usso/workspace?workspace_id=user-abc"]
+            ),
             item=WorkspaceSchema(
                 name="Child",
                 tenant_id="tenant-1",
@@ -263,7 +265,9 @@ def test_manage_on_unrelated_denied_for_invite() -> None:
     workspace = SimpleNamespace(uid="c1", ancestor_ids=["p1"])
     with pytest.raises(ForbiddenError) as exc:
         services.require_workspace_manage_on_target_or_ancestor(
-            user_data=_user_data(scopes=["manage:sso/usso/workspace?workspace_id=other"]),
+            user_data=_user_data(
+                scopes=["manage:sso/usso/workspace?workspace_id=other"]
+            ),
             workspace=workspace,
         )
     assert exc.value.error_code == "workspace_manage_denied"

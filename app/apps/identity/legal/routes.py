@@ -75,16 +75,11 @@ class LegalDocumentRouter(AbstractTenantUSSORouter):
         import asyncio
 
         from usso import USSOException
-        from usso.integrations.fastapi import USSOAuthentication
 
         tenant = await self.get_tenant(request=request, **kwargs)
-        access_usso: USSOAuthentication = tenant.get_auth(
-            "access", raise_exception=False
-        )
-        temporary_usso: USSOAuthentication = tenant.temporary_auth
         access_user, temporary_user = await asyncio.gather(
-            access_usso.usso_access_security_async(request),
-            temporary_usso.usso_access_security_async(request),
+            tenant.optional_user_async(request, "access"),
+            tenant.optional_user_async(request, "temporary"),
         )
         user = access_user or temporary_user
         if not user:

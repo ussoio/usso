@@ -56,6 +56,10 @@ class UserIdentifier(UserIdentifierSchema, TenantUserEntity):
 
         indexes: ClassVar[list[IndexModel]] = [
             *TenantUserEntity.Settings.indexes,
+            # Live identifiers only: soft-deleted users keep their rows, and a
+            # full unique index made re-creating that account fail with
+            # DuplicateKeyError (findAndModify). Index name changes so startup
+            # builds it next to the old one; drop the old index once.
             IndexModel(
                 [
                     ("tenant_id", ASCENDING),
@@ -63,6 +67,8 @@ class UserIdentifier(UserIdentifierSchema, TenantUserEntity):
                     ("identifier", ASCENDING),
                 ],
                 unique=True,
+                name="tenant_type_identifier_live_unique",
+                partialFilterExpression={"is_deleted": False},
             ),
         ]
 
@@ -267,37 +273,41 @@ class User(UserSchema, TenantScopedEntity):
     async def get_credentials(
         self, method: AuthSecret | None = None, *, not_cached: bool = False
     ) -> list[Credential]:
-        """Retrieve all credentials for this user (optionally filtered by method)."""
-        if getattr(self, "_credentials", None) and not not_cached:
-            return self._credentials
+        """
+        Retrieve usable credentials for this user, optionally filtered by method.
 
-        query = {
-            "tenant_id": self.tenant_id,
-            "user_id": self.uid,
-            "is_deleted": False,
-            "is_active": True,
-            # Expiry is filtered in-memory below (null = never-expires).
-            # Index on tenant_id+user_id+is_active covers lookup.
-        }
-        if method is not None:
-            query["method"] = method
+        The cache may be filled by ``find_user`` with every credential row
+        (other methods, inactive, expired, deleted). Filters are therefore
+        applied on every call, including cache hits. Before this, a cache hit
+        ignored ``method`` and a phone OTP was accepted as a password.
+        """
+        cached = getattr(self, "_credentials", None)
+        if not cached or not_cached:
+            query = {
+                "tenant_id": self.tenant_id,
+                "user_id": self.uid,
+                "is_deleted": False,
+                "is_active": True,
+                # Expiry is filtered in-memory below (null = never-expires).
+                # Index on tenant_id+user_id+is_active covers lookup.
+            }
+            cached = await Credential.get_query(**query).to_list()
+            self._credentials = cached
 
         def ensure_aware(dt: datetime) -> datetime:
-            if dt is None:
-                return None
             if dt.tzinfo is None:
                 return dt.replace(tzinfo=timezone.tz)
             return dt
 
-        creds: list[Credential] = await Credential.get_query(**query).to_list()
-        self.credentials = [
+        now = datetime.now(timezone.tz)
+        return [
             cred
-            for cred in creds
-            if cred.expires_at is None
-            or ensure_aware(cred.expires_at) > datetime.now(timezone.tz)
+            for cred in cached
+            if (method is None or cred.method == method)
+            and getattr(cred, "is_active", True)
+            and not getattr(cred, "is_deleted", False)
+            and (cred.expires_at is None or ensure_aware(cred.expires_at) > now)
         ]
-        self._credentials = self.credentials
-        return self.credentials
 
     async def get_profile(self) -> object | None:
         """Get profile for this user."""
@@ -995,3 +1005,23 @@ class User(UserSchema, TenantScopedEntity):
         metadata = page.get("metadata", [])
         total = int(metadata[0]["total"]) if metadata else 0
         return items, total
+
+
+LEGACY_IDENTIFIER_INDEX = "tenant_id_1_type_1_identifier_1"
+
+
+async def drop_legacy_identifier_index() -> bool:
+    """
+    Drop the old full unique index on (tenant_id, type, identifier).
+
+    It counted soft-deleted identifiers, so re-creating a deleted account
+    failed with a duplicate-key error. The partial index
+    ``tenant_type_identifier_live_unique`` replaces it. Idempotent startup step.
+    """
+    collection = UserIdentifier.get_pymongo_collection()
+    indexes = await collection.index_information()
+    legacy = indexes.get(LEGACY_IDENTIFIER_INDEX)
+    if not legacy or legacy.get("partialFilterExpression"):
+        return False
+    await collection.drop_index(LEGACY_IDENTIFIER_INDEX)
+    return True

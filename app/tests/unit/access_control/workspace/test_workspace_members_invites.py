@@ -125,6 +125,35 @@ async def test_add_workspace_member_denies_without_manage_scope() -> None:
     assert exc.value.error_code == "user_manage_denied"
 
 
+def test_can_manage_workspace_members_scopes() -> None:
+    """Tenant scope covers all workspaces; workspace scope covers only its own."""
+    tenant_admin = _user_data(scopes=["manage:sso/usso/member"])
+    ws_manager = _user_data(scopes=["manage:sso/usso/member?workspace_id=ws-1"])
+    assert services.can_manage_workspace_members(
+        user_data=tenant_admin, workspace_id="ws-9"
+    )
+    assert services.can_manage_workspace_members(
+        user_data=ws_manager, workspace_id="ws-1"
+    )
+    assert not services.can_manage_workspace_members(
+        user_data=ws_manager, workspace_id="ws-2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_manager_cannot_add_members_elsewhere() -> None:
+    """A workspace-scoped manager is denied on another workspace."""
+    with pytest.raises(ForbiddenError) as exc:
+        await services.add_workspace_member(
+            tenant=_tenant(),
+            user_data=_user_data(scopes=["manage:sso/usso/member?workspace_id=ws-1"]),
+            workspace_id="ws-2",
+            target_user_id="target-1",
+            role="member",
+        )
+    assert exc.value.error_code == "user_manage_denied"
+
+
 @pytest.mark.asyncio
 async def test_add_workspace_member_raises_when_target_missing() -> None:
     """Target user must exist."""
@@ -573,3 +602,25 @@ async def test_list_my_invitations_returns_items() -> None:
 
     assert total == 1
     assert items == [invitation]
+
+
+@pytest.mark.asyncio
+async def test_backfill_workspace_manager_scope_is_idempotent() -> None:
+    """Existing CEO roles gain the workspace member scope once."""
+    stale = SimpleNamespace(
+        workspace_id="ws-1",
+        scopes=["read:sso/*/*?workspace_id=ws-1"],
+        save=mock.AsyncMock(),
+    )
+    done = SimpleNamespace(
+        workspace_id="ws-2",
+        scopes=["manage:sso/usso/member?workspace_id=ws-2"],
+        save=mock.AsyncMock(),
+    )
+    query = mock.MagicMock()
+    query.to_list = mock.AsyncMock(return_value=[stale, done])
+    with mock.patch.object(services.Role, "find", return_value=query):
+        assert await services.backfill_workspace_manager_scope() == 1
+    assert "manage:sso/usso/member?workspace_id=ws-1" in stale.scopes
+    stale.save.assert_awaited_once()
+    done.save.assert_not_awaited()

@@ -8,10 +8,10 @@ authorization server functionality.
 import base64
 import logging
 from datetime import datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import quote_plus, urlencode
 
 from fastapi import APIRouter, Depends, Form, Query, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi_mongo_base.utils import timezone
 from usso import UserData
 
@@ -38,7 +38,7 @@ from .client_management import (
     regenerate_client_secret,
     update_oauth_client,
 )
-from .models import OAuthClient, OAuthSession
+from .models import OAuthClient, OAuthSession, UserConsent
 from .schemas import (
     AuthorizationRequestSchema,
     ClientRegistrationRequestSchema,
@@ -48,6 +48,7 @@ from .schemas import (
     OuathDeviceAuthorizationDecisionSchema,
     OuathDeviceAuthorizationInfoSchema,
     OuathDeviceAuthorizationResponseSchema,
+    PublicClientRegistrationSchema,
     ResponseType,
     TokenIntrospectionResponseSchema,
     TokenRequestSchema,
@@ -64,6 +65,7 @@ from .services import (
     introspect_token,
     refresh_access_token,
     register_client,
+    register_public_client,
     revoke_token,
     validate_authorization_request,
     validate_client,
@@ -149,6 +151,7 @@ async def authorize(
     nonce: str | None = Query(None, description="Nonce for ID token"),
     prompt: str | None = Query(None, description="Prompt parameter"),
     max_age: int | None = Query(None, description="Maximum authentication age"),
+    provider: str | None = Query(None, description="Social provider shortcut"),
 ) -> RedirectResponse:
     """OAuth2 Authorization endpoint."""
     tenant = await get_tenant(request)
@@ -173,12 +176,40 @@ async def authorize(
 
         current_user = await dependencies.get_current_user_optional(request)
         if not current_user:
+            if provider:
+                # Route an explicitly requested social provider to its login.
+                oauth_authorize_url = (
+                    f"{tenant.primary_url}{Settings.base_path}"
+                    f"/auth/oauth/{provider}/authorize"
+                )
+                return RedirectResponse(
+                    f"{oauth_authorize_url}?return_url={quote_plus(str(request.url))}",
+                )
             login_url = tenant.get_frontend_url("login")
             # set query param to redirect to current url with query params
             params = {"redirect_to": str(request.url)}
             return RedirectResponse(
                 f"{login_url}?{urlencode(params)}",
                 # status_code=status.HTTP_302_FOUND,  # ruff:ignore[commented-out-code]
+            )
+
+        needs_consent = getattr(client, "require_consent", True)
+        if needs_consent and prompt != "consent":
+            needs_consent = not await UserConsent.covers(
+                tenant.uid, current_user.uid, client.client_id, valid_scopes
+            )
+        if not needs_consent and prompt != "consent":
+            return await _handle_authorized_user(
+                client=client,
+                current_user=current_user,
+                tenant=tenant,
+                response_type=response_type,
+                redirect_uri=redirect_uri,
+                valid_scopes=valid_scopes,
+                nonce=nonce,
+                state=state,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
             )
 
         session = await OAuthSession.get_by_state(state, tenant.uid) if state else None
@@ -248,6 +279,42 @@ async def authorize(
         "params": params,
         "client_name": client.client_name,
         "redirect_uri": f"{consent_url}?{urlencode(params | {'consent': 'true'})}",
+    }
+
+
+@oidc_auth_router.get("/consent-info")
+async def get_consent_info(
+    request: Request,
+    state: str = Query(..., description="State parameter"),
+) -> dict:
+    """Return verified client and scope info bound to the OAuth session state."""
+    tenant = await get_tenant(request)
+    session = await OAuthSession.get_by_state(state, tenant.uid)
+    if (
+        not session
+        or session.is_consented
+        or getattr(session, "is_consumed", False)
+        or session.is_expired()
+    ):
+        raise BadRequestError(
+            error_code="invalid_oauth_session",
+            detail="OAuth session is invalid or expired",
+            message={"en": "Invalid session", "fa": "نشست ورود نامعتبر است."},
+        )
+
+    client = await validate_client(session.client_id, tenant)
+    if not client:
+        raise BadRequestError(
+            error_code="invalid_client",
+            detail="OAuth client not found",
+            message={"en": "Client not found", "fa": "کلاینت یافت نشد."},
+        )
+
+    return {
+        "client_id": client.client_id,
+        "client_name": client.client_name or client.client_id,
+        "scopes": list(session.scope),
+        "state": state,
     }
 
 
@@ -334,6 +401,10 @@ async def consent_authorize(
                     "error_description": "Invalid session",
                 }),
             )
+
+        await UserConsent.grant(
+            tenant.uid, current_user.uid, client.client_id, granted_scopes
+        )
 
         # Create authorization code
         auth_code = await create_authorization_code(
@@ -706,6 +777,17 @@ async def revoke(
         ) from e
 
     return {"status": "success"}
+
+
+@oidc_auth_router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register_public_client_endpoint(
+    request: Request,
+    registration_request: PublicClientRegistrationSchema,
+) -> JSONResponse:
+    """RFC 7591 open registration of public PKCE clients (no login needed)."""
+    tenant = await get_tenant(request)
+    result = await register_public_client(registration_request, tenant)
+    return JSONResponse(result, status_code=status.HTTP_201_CREATED)
 
 
 @oidc_client_router.post(
